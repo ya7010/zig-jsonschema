@@ -32,7 +32,7 @@ pub fn main() !void {
         \\{"name": "Widget", "price": 12.5, "quantity": 3, "discount": 0.1,
         \\ "in_stock": true, "tags": ["sale", "new"]}
     ;
-    const valid_result = try js.fromJson(Product, allocator, valid_json);
+    const valid_result = try js.fromJson(Product, allocator, valid_json, .{});
     std.debug.print("== fromJson: valid payload ==\nerrors: {d}\n", .{valid_result.errors.items.len});
     if (valid_result.value) |p| {
         // p is js.Unwrap(Product), so p.price is a plain f64 and p.tags a plain []const []const u8.
@@ -44,7 +44,7 @@ pub fn main() !void {
     const missing_quantity_json =
         \\{"name": "Widget", "price": 12.5, "tags": ["sale"]}
     ;
-    const default_result = try js.fromJson(Product, allocator, missing_quantity_json);
+    const default_result = try js.fromJson(Product, allocator, missing_quantity_json, .{});
     std.debug.print("\n== fromJson: default applied ==\nerrors: {d}\n", .{default_result.errors.items.len});
     if (default_result.value) |p| {
         std.debug.print("parsed: quantity={d} (default)\n", .{p.quantity});
@@ -54,7 +54,7 @@ pub fn main() !void {
     const constraint_violation_json =
         \\{"name": "Widget", "price": -5, "quantity": 5000, "tags": ["sale", "sale"]}
     ;
-    const constraint_result = try js.fromJson(Product, allocator, constraint_violation_json);
+    const constraint_result = try js.fromJson(Product, allocator, constraint_violation_json, .{});
     std.debug.print("\n== fromJson: constraint violations ==\n", .{});
     for (constraint_result.errors.items) |err| {
         std.debug.print("- {s}: {s}\n", .{ err.path, err.message });
@@ -64,7 +64,7 @@ pub fn main() !void {
     const structural_error_json =
         \\{"price": "not a number"}
     ;
-    const structural_result = try js.fromJson(Product, allocator, structural_error_json);
+    const structural_result = try js.fromJson(Product, allocator, structural_error_json, .{});
     std.debug.print("\n== fromJson: structural errors ==\n", .{});
     for (structural_result.errors.items) |err| {
         std.debug.print("- {s}: {s}\n", .{ err.path, err.message });

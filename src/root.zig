@@ -18,7 +18,7 @@
 //!     price: Field(f64, .{ .minimum = 0, .exclusiveMinimum = 0 }),
 //!     tags: Field([]const []const u8, .{ .minItems = 1, .uniqueItems = true }),
 //! };
-//! const result = try fromJson(Product, allocator, json_text);
+//! const result = try fromJson(Product, allocator, json_text, .{});
 //! if (result.value) |p| {
 //!     std.debug.print("{s}: {d}\n", .{ p.name, p.price }); // plain types, no wrapper
 //! }
@@ -333,10 +333,15 @@ fn isOptionalField(comptime f: std.builtin.Type.StructField) bool {
     return @typeInfo(f.type) == .optional;
 }
 
-/// Options shared by schema generation (`toSchemaWithOptions`) and
-/// decoding (`fromJsonWithOptions`), so that a generated schema accepts
+/// Options shared by schema generation (`toSchema`) and
+/// decoding (`fromJson`), so that a generated schema accepts
 /// exactly what `fromJson` accepts when both use the same options.
 pub const SchemaOptions = struct {
+    /// Emit this URI as the root's `$id` (`id` in draft 4), right after
+    /// `$schema`. It names the schema and becomes the base URI that the
+    /// generated `$ref`s resolve against. From 2019-09 on it must not have
+    /// a non-empty fragment. Generation only.
+    id: ?[]const u8 = null,
     /// JSON Schema version (dialect) to generate. Generation only.
     draft: Draft = .draft2020_12,
     /// Emit `$schema` at the root, so consumers know which dialect the
@@ -367,19 +372,13 @@ fn additionalPropertiesFor(explicit: ?bool, options: SchemaOptions) ?bool {
     };
 }
 
-/// Builds a JSON Schema (draft 2020-12, without `$schema`, every struct
-/// inlined) from type `Schema` at comptime. Every `std.json.Value` in the
-/// result is owned by `allocator` (using an `ArenaAllocator` at the call
-/// site is recommended). Use `toSchemaWithOptions` to pick another draft or
-/// to share struct definitions.
-pub fn toSchema(comptime Schema: type, allocator: Allocator) Allocator.Error!std.json.Value {
-    return toSchemaWithOptions(Schema, allocator, .{ .emit_schema_uri = false, .reuse_definitions = false });
-}
-
-/// Like `toSchema`, but generates the dialect selected by `options.draft`
-/// (e.g. draft 4 expresses `exclusiveMinimum` as a boolean modifier of
-/// `minimum`) and, by default, shares named struct types via `$defs`.
-pub fn toSchemaWithOptions(comptime Schema: type, allocator: Allocator, options: SchemaOptions) Allocator.Error!std.json.Value {
+/// Builds a JSON Schema from type `Schema` at comptime, in the dialect
+/// selected by `options.draft` (e.g. draft 4 expresses `exclusiveMinimum`
+/// as a boolean modifier of `minimum`). Pass `.{}` for the defaults: draft
+/// 2020-12 with `$schema`, named struct types shared via `$defs`. Every
+/// `std.json.Value` in the result is owned by `allocator` (using an
+/// `ArenaAllocator` at the call site is recommended).
+pub fn toSchema(comptime Schema: type, allocator: Allocator, options: SchemaOptions) Allocator.Error!std.json.Value {
     var gen: Gen = .{ .allocator = allocator, .options = options, .inline_next_struct = comptime rootIsStruct(Schema) };
     // A plain root struct that refers to itself is referenced as "#".
     if (comptime isNamedStruct(Schema)) try gen.refs.put(allocator, @typeName(Schema), "#");
@@ -394,6 +393,10 @@ pub fn toSchemaWithOptions(comptime Schema: type, allocator: Allocator, options:
         };
         // `$schema` first, so it reads naturally in the serialized output.
         try obj.put(allocator, "$schema", .{ .string = schema_uri });
+    }
+    if (options.id) |id| {
+        const keyword = if (options.draft == .draft4) "id" else "$id";
+        try obj.put(allocator, keyword, .{ .string = try allocator.dupe(u8, id) });
     }
     var it = body.object.iterator();
     while (it.next()) |e| try obj.put(allocator, e.key_ptr.*, e.value_ptr.*);
@@ -920,13 +923,11 @@ pub fn FromJsonResult(comptime T: type) type {
     };
 }
 
-pub fn fromJson(comptime Schema: type, allocator: Allocator, json_text: []const u8) Allocator.Error!FromJsonResult(Unwrap(Schema)) {
-    return fromJsonWithOptions(Schema, allocator, json_text, .{});
-}
-
-/// Like `fromJson`, but honours `options.unknown_fields` (the generation-only
-/// fields of `SchemaOptions` are ignored).
-pub fn fromJsonWithOptions(
+/// Decodes and validates `json_text` against `Schema`. Pass `.{}` for the
+/// defaults; `options.unknown_fields` is honoured and the generation-only
+/// fields of `SchemaOptions` are ignored, so passing the options given to
+/// `toSchema` makes both accept the same documents.
+pub fn fromJson(
     comptime Schema: type,
     allocator: Allocator,
     json_text: []const u8,
@@ -1132,7 +1133,7 @@ test "toSchema builds constraints for a Field-wrapped numeric field" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const schema = try toSchema(Product, arena.allocator());
+    const schema = try toSchema(Product, arena.allocator(), .{});
 
     const props = schema.object.get("properties").?.object;
     const price = props.get("price").?.object;
@@ -1163,7 +1164,7 @@ test "toSchema builds constraints for string, bool, array and object fields" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const schema = try toSchema(Product, arena.allocator());
+    const schema = try toSchema(Product, arena.allocator(), .{});
     const props = schema.object.get("properties").?.object;
 
     const name = props.get("name").?.object;
@@ -1302,7 +1303,7 @@ test "fromJson maps valid JSON into a plain struct with no errors" {
 
     const result = try fromJson(Product, allocator,
         \\{"name": "Widget", "price": 12.5, "quantity": 3}
-    );
+    , .{});
 
     try std.testing.expectEqual(@as(usize, 0), result.errors.items.len);
     const product = result.value.?;
@@ -1324,7 +1325,7 @@ test "fromJson decodes bool and array fields" {
 
     const result = try fromJson(Product, allocator,
         \\{"in_stock": true, "tags": ["a", "b"]}
-    );
+    , .{});
 
     try std.testing.expectEqual(@as(usize, 0), result.errors.items.len);
     const product = result.value.?;
@@ -1344,7 +1345,7 @@ test "fromJson collects per-item array decode errors" {
 
     const result = try fromJson(Product, allocator,
         \\{"scores": [1.0, "not a number", 3.0]}
-    );
+    , .{});
 
     try std.testing.expect(result.value == null);
     try std.testing.expectEqual(@as(usize, 1), result.errors.items.len);
@@ -1363,7 +1364,7 @@ test "fromJson rejects additional properties when configured" {
 
     const result = try fromJson(Strict, allocator,
         \\{"name": "Widget", "unexpected": 1}
-    );
+    , .{});
 
     try std.testing.expect(result.value == null);
     try std.testing.expectEqual(@as(usize, 1), result.errors.items.len);
@@ -1382,7 +1383,7 @@ test "fromJson collects every constraint violation" {
 
     const result = try fromJson(Product, allocator,
         \\{"price": -5, "quantity": 5000}
-    );
+    , .{});
 
     try std.testing.expect(result.value == null);
     try std.testing.expectEqual(@as(usize, 2), result.errors.items.len);
@@ -1402,7 +1403,7 @@ test "fromJson collects every structural error: missing field, wrong type" {
 
     const result = try fromJson(Product, allocator,
         \\{"price": "not a number"}
-    );
+    , .{});
 
     try std.testing.expect(result.value == null);
     try std.testing.expectEqual(@as(usize, 2), result.errors.items.len);
@@ -1422,7 +1423,7 @@ test "fromJson applies Field-level defaults for missing keys" {
 
     const result = try fromJson(Product, allocator,
         \\{"name": "Widget"}
-    );
+    , .{});
 
     try std.testing.expectEqual(@as(usize, 0), result.errors.items.len);
     try std.testing.expectEqual(@as(u32, 1), result.value.?.quantity);
@@ -1437,7 +1438,7 @@ test "fromJson reports invalid JSON syntax" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const result = try fromJson(Product, allocator, "{not valid json");
+    const result = try fromJson(Product, allocator, "{not valid json", .{});
 
     try std.testing.expect(result.value == null);
     try std.testing.expectEqual(@as(usize, 1), result.errors.items.len);
@@ -1455,7 +1456,7 @@ test "toSchema output is a valid 2020-12 schema that the runtime Validator agree
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const generated = try toSchema(Product, allocator);
+    const generated = try toSchema(Product, allocator, .{});
     var v = Validator.init(std.testing.allocator, .{});
     defer v.deinit();
     try std.testing.expect(try v.isValidSchema(generated));
@@ -1478,13 +1479,13 @@ test "toSchema output is a valid 2020-12 schema that the runtime Validator agree
         ,
     };
     for (cases) |text| {
-        const via_comptime = (try fromJson(Product, allocator, text)).value != null;
+        const via_comptime = (try fromJson(Product, allocator, text, .{})).value != null;
         const instance = try std.json.parseFromSliceLeaky(std.json.Value, allocator, text, .{});
         try std.testing.expectEqual(via_comptime, try schema.isValid(instance));
     }
 }
 
-test "toSchemaWithOptions emits $schema and draft-specific keywords" {
+test "toSchema emits $schema and draft-specific keywords" {
     const Product = struct {
         price: Field(f64, .{ .minimum = 0, .exclusiveMinimum = 0, .maximum = 100 }),
     };
@@ -1493,7 +1494,7 @@ test "toSchemaWithOptions emits $schema and draft-specific keywords" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const d4 = try toSchemaWithOptions(Product, allocator, .{ .draft = .draft4 });
+    const d4 = try toSchema(Product, allocator, .{ .draft = .draft4 });
     try std.testing.expectEqualStrings("http://json-schema.org/draft-04/schema#", d4.object.get("$schema").?.string);
     const price4 = d4.object.get("properties").?.object.get("price").?.object;
     try std.testing.expectEqual(@as(f64, 0), price4.get("minimum").?.float);
@@ -1501,18 +1502,50 @@ test "toSchemaWithOptions emits $schema and draft-specific keywords" {
     try std.testing.expectEqual(@as(f64, 100), price4.get("maximum").?.float);
     try std.testing.expect(price4.get("exclusiveMaximum") == null);
 
-    const d7 = try toSchemaWithOptions(Product, allocator, .{ .draft = .draft7 });
+    const d7 = try toSchema(Product, allocator, .{ .draft = .draft7 });
     try std.testing.expectEqualStrings("http://json-schema.org/draft-07/schema#", d7.object.get("$schema").?.string);
     const price7 = d7.object.get("properties").?.object.get("price").?.object;
     try std.testing.expectEqual(@as(f64, 0), price7.get("exclusiveMinimum").?.float);
 
-    const d2020 = try toSchemaWithOptions(Product, allocator, .{});
+    const d2020 = try toSchema(Product, allocator, .{});
     try std.testing.expectEqualStrings("https://json-schema.org/draft/2020-12/schema", d2020.object.get("$schema").?.string);
-    const plain = try toSchema(Product, allocator);
+    const plain = try toSchema(Product, allocator, .{ .emit_schema_uri = false });
     try std.testing.expect(plain.object.get("$schema") == null);
 }
 
-test "toSchemaWithOptions output is valid for every draft and matches fromJson" {
+test "toSchema emits the root id with the draft's keyword" {
+    const T = reuse_test_types;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const id = "https://example.com/schemas/customer.json";
+    inline for (std.meta.fields(Draft)) |f| {
+        const draft: Draft = @enumFromInt(f.value);
+        const schema = try toSchema(T.Customer, a, .{ .draft = draft, .id = id });
+        const keyword, const other = if (draft == .draft4) .{ "id", "$id" } else .{ "$id", "id" };
+        try std.testing.expectEqualStrings(id, schema.object.get(keyword).?.string);
+        try std.testing.expect(schema.object.get(other) == null);
+        // `$schema` stays first, the id follows it.
+        try std.testing.expectEqualStrings("$schema", schema.object.keys()[0]);
+        try std.testing.expectEqualStrings(keyword, schema.object.keys()[1]);
+
+        // The `$ref`s into the definitions resolve against the id.
+        var v = Validator.init(std.testing.allocator, .{});
+        defer v.deinit();
+        try std.testing.expect(try v.isValidSchema(schema));
+        const compiled = try v.compile(schema);
+        const bad = try std.json.parseFromSliceLeaky(std.json.Value, a,
+            \\{"home": {"zip": ""}, "work": {"zip": "2"}, "strict": {"zip": "3"}, "history": {"entries": []}, "legacy": {"line": "x"}}
+        , .{});
+        try std.testing.expect(!try compiled.isValid(bad));
+    }
+
+    const without = try toSchema(T.Customer, a, .{});
+    try std.testing.expect(without.object.get("$id") == null);
+}
+
+test "toSchema output is valid for every draft and matches fromJson" {
     const Product = struct {
         name: Field([]const u8, .{ .minLength = 1, .maxLength = 10 }),
         price: Field(f64, .{ .minimum = 1, .exclusiveMinimum = 0, .exclusiveMaximum = 1000 }),
@@ -1565,7 +1598,7 @@ test "toSchemaWithOptions output is valid for every draft and matches fromJson" 
     inline for (std.meta.fields(Draft)) |f| {
         for ([_]UnknownFields{ .allow, .deny }) |mode| {
             const options: SchemaOptions = .{ .draft = @enumFromInt(f.value), .unknown_fields = mode };
-            const generated = try toSchemaWithOptions(Product, allocator, options);
+            const generated = try toSchema(Product, allocator, options);
 
             // The runtime validator picks the dialect up from `$schema`, not from its default.
             var v = Validator.init(std.testing.allocator, .{ .default_draft = .draft2020_12 });
@@ -1573,7 +1606,7 @@ test "toSchemaWithOptions output is valid for every draft and matches fromJson" 
             try std.testing.expect(try v.isValidSchema(generated));
             const schema = try v.compile(generated);
             for (cases) |text| {
-                const via_comptime = (try fromJsonWithOptions(Product, allocator, text, options)).value != null;
+                const via_comptime = (try fromJson(Product, allocator, text, options)).value != null;
                 const instance = try std.json.parseFromSliceLeaky(std.json.Value, allocator, text, .{});
                 try std.testing.expectEqual(via_comptime, try schema.isValid(instance));
             }
@@ -1589,7 +1622,7 @@ test "toSchema makes optional types nullable" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const schema = try toSchema(Product, arena.allocator());
+    const schema = try toSchema(Product, arena.allocator(), .{});
     const props = schema.object.get("properties").?.object;
 
     const discount = props.get("discount").?.object;
@@ -1620,12 +1653,12 @@ test "unknown_fields = .deny rejects unknown keys at every level unless a Field 
     const ok =
         \\{"name": "W", "billing": null, "items": [{"zip": "1"}], "extras": {"source": "s", "free": 1}}
     ;
-    try std.testing.expect((try fromJsonWithOptions(Product, a, ok, deny)).value != null);
+    try std.testing.expect((try fromJson(Product, a, ok, deny)).value != null);
 
     const bad =
         \\{"name": "W", "top": 1, "billing": {"zip": "1", "city": "X"}, "items": [{"zip": "1", "n": 2}], "extras": {"source": "s"}}
     ;
-    const result = try fromJsonWithOptions(Product, a, bad, deny);
+    const result = try fromJson(Product, a, bad, deny);
     try std.testing.expect(result.value == null);
     try std.testing.expectEqual(@as(usize, 3), result.errors.items.len);
     try std.testing.expectEqualStrings("top", result.errors.items[0].path);
@@ -1633,10 +1666,10 @@ test "unknown_fields = .deny rejects unknown keys at every level unless a Field 
     try std.testing.expectEqualStrings("items.0.n", result.errors.items[2].path);
 
     // The default still ignores unknown keys.
-    try std.testing.expect((try fromJson(Product, a, bad)).value != null);
+    try std.testing.expect((try fromJson(Product, a, bad, .{})).value != null);
 
     // Inlined, so the nested objects can be inspected directly.
-    const schema = try toSchemaWithOptions(Product, a, .{ .unknown_fields = .deny, .reuse_definitions = false });
+    const schema = try toSchema(Product, a, .{ .unknown_fields = .deny, .reuse_definitions = false });
     try std.testing.expectEqual(false, schema.object.get("additionalProperties").?.bool);
     const props = schema.object.get("properties").?.object;
     try std.testing.expectEqual(false, props.get("billing").?.object.get("additionalProperties").?.bool);
@@ -1650,8 +1683,8 @@ test "an explicit additionalProperties = false also applies to optional objects"
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    try std.testing.expect((try fromJson(Product, a, "{\"billing\": null}")).value != null);
-    try std.testing.expect((try fromJson(Product, a, "{\"billing\": {\"zip\": \"1\", \"x\": 1}}")).value == null);
+    try std.testing.expect((try fromJson(Product, a, "{\"billing\": null}", .{})).value != null);
+    try std.testing.expect((try fromJson(Product, a, "{\"billing\": {\"zip\": \"1\", \"x\": 1}}", .{})).value == null);
 }
 
 test "an explicit additionalProperties on the root struct overrides unknown_fields" {
@@ -1677,24 +1710,24 @@ test "an explicit additionalProperties on the root struct overrides unknown_fiel
 
     // fromJson: the root follows its explicit setting, the unlabelled
     // nested struct follows the options.
-    try std.testing.expect((try fromJsonWithOptions(Open, a, root_extra, deny)).value != null);
-    const open_nested = try fromJsonWithOptions(Open, a, nested_extra, deny);
+    try std.testing.expect((try fromJson(Open, a, root_extra, deny)).value != null);
+    const open_nested = try fromJson(Open, a, nested_extra, deny);
     try std.testing.expect(open_nested.value == null);
     try std.testing.expectEqualStrings("address.city", open_nested.errors.items[0].path);
 
-    const closed_root = try fromJsonWithOptions(Closed, a, root_extra, allow);
+    const closed_root = try fromJson(Closed, a, root_extra, allow);
     try std.testing.expect(closed_root.value == null);
     try std.testing.expectEqualStrings("extra", closed_root.errors.items[0].path);
-    try std.testing.expect((try fromJsonWithOptions(Closed, a, nested_extra, allow)).value != null);
+    try std.testing.expect((try fromJson(Closed, a, nested_extra, allow)).value != null);
 
     // toSchema emits the same decisions.
     // Inlined, so the nested objects can be inspected directly.
-    const open_schema = try toSchemaWithOptions(Open, a, .{ .unknown_fields = .deny, .reuse_definitions = false });
+    const open_schema = try toSchema(Open, a, .{ .unknown_fields = .deny, .reuse_definitions = false });
     try std.testing.expectEqual(true, open_schema.object.get("additionalProperties").?.bool);
     const open_address = open_schema.object.get("properties").?.object.get("address").?.object;
     try std.testing.expectEqual(false, open_address.get("additionalProperties").?.bool);
 
-    const closed_schema = try toSchemaWithOptions(Closed, a, .{ .unknown_fields = .allow, .reuse_definitions = false });
+    const closed_schema = try toSchema(Closed, a, .{ .unknown_fields = .allow, .reuse_definitions = false });
     try std.testing.expectEqual(false, closed_schema.object.get("additionalProperties").?.bool);
     const closed_address = closed_schema.object.get("properties").?.object.get("address").?.object;
     try std.testing.expect(closed_address.get("additionalProperties") == null);
@@ -1712,9 +1745,9 @@ test "an explicit additionalProperties on the root struct overrides unknown_fiel
         const compiled = try v.compile(c.schema);
         const instance = try std.json.parseFromSliceLeaky(std.json.Value, a, c.text, .{});
         const via_comptime = if (c.open)
-            (try fromJsonWithOptions(Open, a, c.text, c.options)).value != null
+            (try fromJson(Open, a, c.text, c.options)).value != null
         else
-            (try fromJsonWithOptions(Closed, a, c.text, c.options)).value != null;
+            (try fromJson(Closed, a, c.text, c.options)).value != null;
         try std.testing.expectEqual(via_comptime, try compiled.isValid(instance));
     }
 }
@@ -1741,7 +1774,7 @@ test "non-exhaustive enums are integer newtypes" {
 
     const ok = try fromJson(Order, a,
         \\{"buyer": 7, "seller": 3, "watchers": [1, 2], "referrer": null}
-    );
+    , .{});
     try std.testing.expectEqual(@as(usize, 0), ok.errors.items.len);
     const order = ok.value.?;
     try std.testing.expectEqual(@as(UserId, @enumFromInt(7)), order.buyer);
@@ -1750,19 +1783,19 @@ test "non-exhaustive enums are integer newtypes" {
 
     const bad = try fromJson(Order, a,
         \\{"buyer": -1, "seller": 0, "watchers": [1, 1], "referrer": "x"}
-    );
+    , .{});
     try std.testing.expect(bad.value == null);
     try std.testing.expectEqualStrings("buyer", bad.errors.items[0].path); // does not fit in u32
     try std.testing.expectEqualStrings("referrer", bad.errors.items[1].path); // not an integer
 
     const constraint = try fromJson(Order, a,
         \\{"buyer": 1, "seller": 0, "watchers": [1, 1]}
-    );
+    , .{});
     try std.testing.expectEqual(@as(usize, 2), constraint.errors.items.len);
     try std.testing.expectEqualStrings("seller", constraint.errors.items[0].path); // minimum
     try std.testing.expectEqualStrings("watchers", constraint.errors.items[1].path); // uniqueItems
 
-    const schema = try toSchema(Order, a);
+    const schema = try toSchema(Order, a, .{});
     const props = schema.object.get("properties").?.object;
     try std.testing.expectEqualStrings("integer", props.get("buyer").?.object.get("type").?.string);
     try std.testing.expectEqual(@as(f64, 1), props.get("seller").?.object.get("minimum").?.float);
@@ -1809,7 +1842,7 @@ test "reuse_definitions emits each named struct once and refers to it" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const schema = try toSchemaWithOptions(T.Customer, a, .{});
+    const schema = try toSchema(T.Customer, a, .{});
     const defs = schema.object.get("$defs").?.object;
     try std.testing.expectEqual(@as(usize, 3), defs.count());
     try std.testing.expect(defs.get("Address") != null);
@@ -1833,13 +1866,13 @@ test "reuse_definitions emits each named struct once and refers to it" {
     try std.testing.expectEqualStrings("#/$defs/Address_2", props.get("legacy").?.object.get("$ref").?.string);
 
     // Drafts before 2019-09 use `definitions`.
-    const d7 = try toSchemaWithOptions(T.Customer, a, .{ .draft = .draft7 });
+    const d7 = try toSchema(T.Customer, a, .{ .draft = .draft7 });
     try std.testing.expect(d7.object.get("$defs") == null);
     try std.testing.expect(d7.object.get("definitions").?.object.get("Address") != null);
     try std.testing.expectEqualStrings("#/definitions/Address", d7.object.get("properties").?.object.get("home").?.object.get("$ref").?.string);
 
-    // toSchema keeps inlining everything.
-    const inlined = try toSchema(T.Customer, a);
+    // With reuse off, every non-recursive struct is inlined.
+    const inlined = try toSchema(T.Customer, a, .{ .reuse_definitions = false });
     try std.testing.expect(inlined.object.get("$defs") == null);
     try std.testing.expectEqualStrings("object", inlined.object.get("properties").?.object.get("home").?.object.get("type").?.string);
 }
@@ -1865,7 +1898,7 @@ test "recursive types reference themselves in every mode" {
     const a = arena.allocator();
 
     for ([_]bool{ true, false }) |reuse| {
-        const tree = try toSchemaWithOptions(T.TreeNode, a, .{ .reuse_definitions = reuse });
+        const tree = try toSchema(T.TreeNode, a, .{ .reuse_definitions = reuse });
         const children = tree.object.get("properties").?.object.get("children").?.object;
         try std.testing.expectEqualStrings("#", children.get("items").?.object.get("$ref").?.string);
         try std.testing.expect(tree.object.get("$defs") == null);
@@ -1873,7 +1906,7 @@ test "recursive types reference themselves in every mode" {
 
     // Mutual recursion through the root: `Item` can be inlined, since its
     // way back to `Category` is the root ("#").
-    const cat = try toSchemaWithOptions(T.Category, a, .{ .reuse_definitions = false });
+    const cat = try toSchema(T.Category, a, .{ .reuse_definitions = false });
     try std.testing.expect(cat.object.get("$defs") == null);
     const item = cat.object.get("properties").?.object.get("items").?.object.get("items").?.object;
     const related = item.get("properties").?.object.get("related").?.object;
@@ -1882,7 +1915,7 @@ test "recursive types reference themselves in every mode" {
     // Recursion below the root: even with reuse off, the recursive type
     // becomes a definition so the schema stays finite.
     const Wrapper = struct { root: T.Category };
-    const wrapped = try toSchemaWithOptions(Wrapper, a, .{ .reuse_definitions = false });
+    const wrapped = try toSchema(Wrapper, a, .{ .reuse_definitions = false });
     const defs = wrapped.object.get("$defs").?.object;
     const cat_items = defs.get("Category").?.object.get("properties").?.object.get("items").?.object;
     try std.testing.expectEqualStrings("#/$defs/Item", cat_items.get("items").?.object.get("$ref").?.string);
@@ -1891,7 +1924,7 @@ test "recursive types reference themselves in every mode" {
 
     const decoded = try fromJson(T.TreeNode, a,
         \\{"name": "root", "children": [{"name": "a", "children": []}, {"name": "b", "children": [{"name": "c", "children": []}]}]}
-    );
+    , .{});
     try std.testing.expectEqual(@as(usize, 0), decoded.errors.items.len);
     try std.testing.expectEqualStrings("c", decoded.value.?.children[1].children[0].name);
 }
@@ -1929,20 +1962,20 @@ test "shared definitions and recursive schemas agree with fromJson on every draf
             var v = Validator.init(std.testing.allocator, .{});
             defer v.deinit();
 
-            const customer = try toSchemaWithOptions(T.Customer, a, options);
+            const customer = try toSchema(T.Customer, a, options);
             try std.testing.expect(try v.isValidSchema(customer));
             const customer_schema = try v.compile(customer);
             for (customer_cases) |text| {
-                const expected = (try fromJsonWithOptions(T.Customer, a, text, options)).value != null;
+                const expected = (try fromJson(T.Customer, a, text, options)).value != null;
                 const instance = try std.json.parseFromSliceLeaky(std.json.Value, a, text, .{});
                 try std.testing.expectEqual(expected, try customer_schema.isValid(instance));
             }
 
-            const tree = try toSchemaWithOptions(T.TreeNode, a, options);
+            const tree = try toSchema(T.TreeNode, a, options);
             try std.testing.expect(try v.isValidSchema(tree));
             const tree_schema = try v.compile(tree);
             for (tree_cases) |text| {
-                const expected = (try fromJsonWithOptions(T.TreeNode, a, text, options)).value != null;
+                const expected = (try fromJson(T.TreeNode, a, text, options)).value != null;
                 const instance = try std.json.parseFromSliceLeaky(std.json.Value, a, text, .{});
                 try std.testing.expectEqual(expected, try tree_schema.isValid(instance));
             }

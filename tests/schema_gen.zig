@@ -1,4 +1,4 @@
-//! Snapshot tests for schema generation (`toSchemaWithOptions`).
+//! Snapshot tests for schema generation (`toSchema`).
 //!
 //! Every case below is generated for every supported draft and compared
 //! with the reviewed snapshot in `tests/schema_gen/<case>/<draft>.schema.json`.
@@ -40,7 +40,7 @@ fn checkCaseWith(comptime case_name: []const u8, comptime Schema: type, base: js
     for (drafts) |d| {
         var opts = base;
         opts.draft = d.draft;
-        const schema = try js.toSchemaWithOptions(Schema, arena, opts);
+        const schema = try js.toSchema(Schema, arena, opts);
         const actual = try std.fmt.allocPrint(arena, "{s}\n", .{
             try std.json.Stringify.valueAlloc(arena, schema, .{ .whitespace = .indent_2 }),
         });
@@ -237,4 +237,11 @@ test "recursive_mutual: mutually recursive types" {
         root: Category,
         featured: ?Item,
     });
+}
+
+test "with_id: a root $id (id in draft 4) that the $refs resolve against" {
+    try checkCaseWith("with_id", struct {
+        home: Address,
+        billing: ?Address,
+    }, .{ .id = "https://example.com/schemas/order.json" });
 }

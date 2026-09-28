@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2019-09/schema",
+  "$id": "https://example.com/schemas/order.json",
+  "type": "object",
+  "properties": {
+    "home": {
+      "$ref": "#/$defs/Address"
+    },
+    "billing": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Address"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "required": [
+    "home"
+  ],
+  "$defs": {
+    "Address": {
+      "type": "object",
+      "properties": {
+        "street": {
+          "type": "string",
+          "minLength": 1
+        },
+        "zip": {
+          "type": "string",
+          "pattern": "^[0-9]{3}-[0-9]{4}$"
+        }
+      },
+      "required": [
+        "street",
+        "zip"
+      ]
+    }
+  }
+}

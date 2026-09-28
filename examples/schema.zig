@@ -28,13 +28,13 @@ pub fn main() !void {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    // Generate a JSON Schema at comptime
-    const schema = try js.toSchema(Product, allocator);
+    // Generate a JSON Schema at comptime (defaults: draft 2020-12, with `$schema`)
+    const schema = try js.toSchema(Product, allocator, .{ .id = "https://example.com/product.schema.json" });
     const schema_json = try std.json.Stringify.valueAlloc(allocator, schema, .{ .whitespace = .indent_2 });
     std.debug.print("== JSON Schema ==\n{s}\n", .{schema_json});
 
-    // Generate for a specific draft (here draft-07); `$schema` is emitted too.
-    const draft7 = try js.toSchemaWithOptions(Product, allocator, .{ .draft = .draft7 });
+    // Generate for a specific draft (here draft-07).
+    const draft7 = try js.toSchema(Product, allocator, .{ .draft = .draft7 });
     const draft7_json = try std.json.Stringify.valueAlloc(allocator, draft7, .{ .whitespace = .indent_2 });
     std.debug.print("\n== JSON Schema (draft-07) ==\n{s}\n", .{draft7_json});
 }
