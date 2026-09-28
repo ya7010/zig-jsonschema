@@ -6,6 +6,16 @@
       "type": "string"
     },
     "address": {
+      "$ref": "#/$defs/Address"
+    }
+  },
+  "required": [
+    "name",
+    "address"
+  ],
+  "additionalProperties": true,
+  "$defs": {
+    "Address": {
       "type": "object",
       "properties": {
         "street": {
@@ -23,10 +33,5 @@
       ],
       "additionalProperties": false
     }
-  },
-  "required": [
-    "name",
-    "address"
-  ],
-  "additionalProperties": true
+  }
 }

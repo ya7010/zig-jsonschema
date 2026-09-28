@@ -3,64 +3,23 @@
   "type": "object",
   "properties": {
     "address": {
-      "type": "object",
-      "properties": {
-        "street": {
-          "type": "string",
-          "minLength": 1
-        },
-        "zip": {
-          "type": "string",
-          "pattern": "^[0-9]{3}-[0-9]{4}$"
-        }
-      },
-      "required": [
-        "street",
-        "zip"
-      ],
-      "additionalProperties": false
+      "$ref": "#/definitions/Address"
     },
     "previous": {
       "type": "array",
       "items": {
-        "type": "object",
-        "properties": {
-          "street": {
-            "type": "string",
-            "minLength": 1
-          },
-          "zip": {
-            "type": "string",
-            "pattern": "^[0-9]{3}-[0-9]{4}$"
-          }
-        },
-        "required": [
-          "street",
-          "zip"
-        ],
-        "additionalProperties": false
+        "$ref": "#/definitions/Address"
       }
     },
     "billing": {
-      "type": [
-        "object",
-        "null"
-      ],
-      "properties": {
-        "street": {
-          "type": "string",
-          "minLength": 1
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Address"
         },
-        "zip": {
-          "type": "string",
-          "pattern": "^[0-9]{3}-[0-9]{4}$"
+        {
+          "type": "null"
         }
-      },
-      "required": [
-        "street",
-        "zip"
-      ],
-      "additionalProperties": false
+      ]
     },
     "metadata": {
       "type": "object",
@@ -80,5 +39,25 @@
     "previous",
     "metadata"
   ],
-  "additionalProperties": false
+  "additionalProperties": false,
+  "definitions": {
+    "Address": {
+      "type": "object",
+      "properties": {
+        "street": {
+          "type": "string",
+          "minLength": 1
+        },
+        "zip": {
+          "type": "string",
+          "pattern": "^[0-9]{3}-[0-9]{4}$"
+        }
+      },
+      "required": [
+        "street",
+        "zip"
+      ],
+      "additionalProperties": false
+    }
+  }
 }

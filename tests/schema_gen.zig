@@ -148,13 +148,19 @@ const Address = struct {
     zip: Field([]const u8, .{ .pattern = "^[0-9]{3}-[0-9]{4}$" }),
 };
 
+const Customer = Field(struct {
+    address: Address,
+    previous: Field([]const Address, .{ .maxItems = 3 }),
+    metadata: Field(struct { source: []const u8 }, .{ .additionalProperties = true, .minProperties = 1 }),
+    billing: ?Address,
+}, .{ .title = "Customer", .additionalProperties = false });
+
 test "nested_objects: structs, arrays of structs and object constraints" {
-    try checkCase("nested_objects", Field(struct {
-        address: Address,
-        previous: Field([]const Address, .{ .maxItems = 3 }),
-        metadata: Field(struct { source: []const u8 }, .{ .additionalProperties = true, .minProperties = 1 }),
-        billing: ?Address,
-    }, .{ .title = "Customer", .additionalProperties = false }));
+    try checkCase("nested_objects", Customer);
+}
+
+test "nested_objects_inline: the same type with reuse_definitions = false" {
+    try checkCaseWith("nested_objects_inline", Customer, .{ .reuse_definitions = false });
 }
 
 test "unknown_fields_deny: additionalProperties false everywhere unless overridden" {
@@ -173,4 +179,62 @@ test "unknown_fields_deny_open_root: an explicit root setting overrides unknown_
         /// Not labelled, so it still follows `unknown_fields = .deny`.
         address: Address,
     }, .{ .additionalProperties = true }), .{ .unknown_fields = .deny });
+}
+
+const UserId = enum(u64) { _ };
+
+test "newtype_enum: non-exhaustive enums as integer newtypes" {
+    try checkCase("newtype_enum", struct {
+        id: UserId,
+        owner: Field(UserId, .{ .minimum = 1, .description = "Owner account" }),
+        members: Field([]const UserId, .{ .uniqueItems = true }),
+        parent: ?UserId,
+    });
+}
+
+fn Page(comptime T: type) type {
+    return struct { items: []const T, total: u32 };
+}
+
+const legacy = struct {
+    /// Same short name as `Address`: emitted as `Address_2`.
+    const Address = struct { line: []const u8 };
+};
+
+test "shared_definitions: use-site keywords, optional references and name clashes" {
+    try checkCase("shared_definitions", struct {
+        home: Address,
+        work: Field(Address, .{ .description = "Office address", .minProperties = 1 }),
+        billing: ?Address,
+        /// Explicit additionalProperties: inlined instead of referenced.
+        strict: Field(Address, .{ .additionalProperties = false }),
+        history: Page(Address),
+        legacy: legacy.Address,
+    });
+}
+
+const TreeNode = struct {
+    name: []const u8,
+    children: []const TreeNode,
+};
+
+const Category = struct {
+    name: []const u8,
+    items: []const Item,
+};
+
+const Item = struct {
+    title: []const u8,
+    related: []const Category,
+};
+
+test "recursive_tree: a self-referencing root" {
+    try checkCase("recursive_tree", TreeNode);
+}
+
+test "recursive_mutual: mutually recursive types" {
+    try checkCase("recursive_mutual", struct {
+        root: Category,
+        featured: ?Item,
+    });
 }

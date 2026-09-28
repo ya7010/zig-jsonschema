@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "root": {
+      "$ref": "#/$defs/Category"
+    },
+    "featured": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Item"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "required": [
+    "root"
+  ],
+  "$defs": {
+    "Category": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Item"
+          }
+        }
+      },
+      "required": [
+        "name",
+        "items"
+      ]
+    },
+    "Item": {
+      "type": "object",
+      "properties": {
+        "title": {
+          "type": "string"
+        },
+        "related": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Category"
+          }
+        }
+      },
+      "required": [
+        "title",
+        "related"
+      ]
+    }
+  }
+}

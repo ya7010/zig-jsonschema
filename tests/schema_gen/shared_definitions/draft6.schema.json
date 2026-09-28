@@ -1,0 +1,107 @@
+{
+  "$schema": "http://json-schema.org/draft-06/schema#",
+  "type": "object",
+  "properties": {
+    "home": {
+      "$ref": "#/definitions/Address"
+    },
+    "work": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/Address"
+        }
+      ],
+      "description": "Office address",
+      "minProperties": 1
+    },
+    "billing": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Address"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "strict": {
+      "type": "object",
+      "properties": {
+        "street": {
+          "type": "string",
+          "minLength": 1
+        },
+        "zip": {
+          "type": "string",
+          "pattern": "^[0-9]{3}-[0-9]{4}$"
+        }
+      },
+      "required": [
+        "street",
+        "zip"
+      ],
+      "additionalProperties": false
+    },
+    "history": {
+      "$ref": "#/definitions/Page_Address"
+    },
+    "legacy": {
+      "$ref": "#/definitions/Address_2"
+    }
+  },
+  "required": [
+    "home",
+    "work",
+    "strict",
+    "history",
+    "legacy"
+  ],
+  "definitions": {
+    "Address": {
+      "type": "object",
+      "properties": {
+        "street": {
+          "type": "string",
+          "minLength": 1
+        },
+        "zip": {
+          "type": "string",
+          "pattern": "^[0-9]{3}-[0-9]{4}$"
+        }
+      },
+      "required": [
+        "street",
+        "zip"
+      ]
+    },
+    "Page_Address": {
+      "type": "object",
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Address"
+          }
+        },
+        "total": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "items",
+        "total"
+      ]
+    },
+    "Address_2": {
+      "type": "object",
+      "properties": {
+        "line": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "line"
+      ]
+    }
+  }
+}
