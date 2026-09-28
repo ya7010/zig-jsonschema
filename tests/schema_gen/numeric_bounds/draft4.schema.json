@@ -24,17 +24,22 @@
     "equal_bounds": {
       "type": "integer",
       "minimum": 0,
-      "exclusiveMinimum": true
+      "exclusiveMinimum": true,
+      "maximum": 9223372036854775807
     },
     "step": {
       "type": "number",
       "multipleOf": 0.5
     },
     "plain_int": {
-      "type": "integer"
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 255
     },
     "plain_float": {
-      "type": "number"
+      "type": "number",
+      "minimum": -3.4028234663852886e38,
+      "maximum": 3.4028234663852886e38
     }
   },
   "required": [

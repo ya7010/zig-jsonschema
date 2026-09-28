@@ -4,8 +4,13 @@
 //! 2019-09 and 2020-12), verified against the official
 //! JSON-Schema-Test-Suite (`zig build test-suite`).
 //!
-//! Supported kinds: number (int/float), string, boolean, array (Zig slice),
-//! and object (Zig struct), each with its own constraint set.
+//! Supported kinds: number (int/float, bounded by the type's range), string,
+//! boolean, array (Zig slice), object (Zig struct), tagged union
+//! (`union(enum)`, as `oneOf`), integer newtype (non-exhaustive enum) and
+//! single-item pointer (transparent), each with its own constraint set.
+//! `SchemaOptions` picks the draft, unknown-key handling and JSON key
+//! spelling (`field_naming`), shared by `toSchema` and `fromJson` so that
+//! both accept the same documents.
 //!
 //! `Field(T, constraints)` never becomes a real type at runtime; it is only a
 //! **schema declaration label**. The type actually read/written by callers is
@@ -49,6 +54,7 @@ pub const CompileError = validator.CompileError;
 pub const ValidateError = validator.ValidateError;
 pub const SchemaError = validator.Error;
 pub const Result = validator.Result;
+pub const OutputFormat = validator.OutputFormat;
 pub const Regex = @import("regex.zig").Regex;
 pub const format = @import("format.zig");
 
@@ -82,11 +88,13 @@ pub const StringConstraints = struct {
     /// Default value used when the field is absent from the JSON input.
     default: ?[]const u8 = null,
 
+    /// Lengths count Unicode code points, as JSON Schema does.
     minLength: ?usize = null,
     maxLength: ?usize = null,
-    /// Emitted into the generated schema, but NOT enforced by `validate`/
-    /// `fromJson`: Zig's standard library has no regex engine. Validate this
-    /// externally if you need it enforced.
+    /// An ECMA-262 regular expression, matched anywhere in the string (anchor
+    /// it with `^...$` to match the whole string). Enforced by `validate` /
+    /// `fromJson` with the same engine as the runtime `Validator`, within
+    /// `Regex.default_step_limit` steps.
     pattern: ?[]const u8 = null,
 };
 
@@ -129,6 +137,17 @@ pub const ObjectConstraints = struct {
     additionalProperties: ?bool = null,
 };
 
+/// Constraints for a tagged union (`union(enum)`), which maps to a `oneOf`
+/// with one branch per variant. By default a value is written as
+/// `{"<variant>": <payload>}` (a void payload as `{}`), as std.json does.
+/// A union that declares `pub const json_discriminator = "kind";` is
+/// written internally tagged instead: `{"kind": "<variant>", ...payload
+/// fields}`, which requires every payload to be a struct or void.
+pub const UnionConstraints = struct {
+    title: ?[]const u8 = null,
+    description: ?[]const u8 = null,
+};
+
 /// Selects the constraints type that applies to `T` (or, if `T` is
 /// optional, to its child type).
 fn ConstraintsFor(comptime T: type) type {
@@ -149,11 +168,44 @@ fn ConstraintsFor(comptime T: type) type {
         .pointer => |p| blk: {
             if (p.size == .slice and p.child == u8) break :blk StringConstraints;
             if (p.size == .slice) break :blk ArrayConstraints;
+            if (p.size == .one) break :blk ConstraintsFor(p.child); // transparent
             @compileError("zig-jsonschema: unsupported Field inner type " ++ @typeName(T));
         },
         .@"struct" => ObjectConstraints,
+        .@"union" => blk: {
+            requireTaggedUnion(Inner);
+            break :blk UnionConstraints;
+        },
         else => @compileError("zig-jsonschema: unsupported Field inner type " ++ @typeName(T)),
     };
+}
+
+fn requireTaggedUnion(comptime T: type) void {
+    if (@typeInfo(T).@"union".tag_type == null) {
+        @compileError("zig-jsonschema: untagged union " ++ @typeName(T) ++ " is not supported; use union(enum)");
+    }
+}
+
+/// The discriminator key of an internally tagged union, or null.
+fn discriminatorOf(comptime T: type) ?[]const u8 {
+    if (!@hasDecl(T, "json_discriminator")) return null;
+    const key: []const u8 = T.json_discriminator;
+    for (@typeInfo(T).@"union".fields) |f| {
+        const Payload = stripField(f.type);
+        switch (@typeInfo(Payload)) {
+            .void => {},
+            .@"struct" => if (@hasField(Payload, key)) @compileError("zig-jsonschema: variant '" ++ f.name ++ "' of " ++
+                @typeName(T) ++ " has a field named like the discriminator '" ++ key ++ "'"),
+            else => @compileError("zig-jsonschema: variant '" ++ f.name ++ "' of internally tagged union " ++
+                @typeName(T) ++ " must be a struct or void, got " ++ @typeName(Payload)),
+        }
+    }
+    return key;
+}
+
+/// `T` below its `Field()` label, if any.
+fn stripField(comptime T: type) type {
+    return if (isField(T)) T.zjs_inner else T;
 }
 
 /// A non-exhaustive enum (`enum(u64) { _ }`) is Zig's idiomatic integer
@@ -200,7 +252,7 @@ pub fn Unwrap(comptime Schema: type) type {
     if (comptime isField(Schema)) return Unwrap(Schema.zjs_inner);
 
     return switch (@typeInfo(Schema)) {
-        .int, .float, .bool => Schema,
+        .int, .float, .bool, .void => Schema,
         .@"enum" => blk: {
             requireOpenEnum(Schema);
             break :blk Schema; // the newtype itself is kept, for type safety
@@ -209,6 +261,9 @@ pub fn Unwrap(comptime Schema: type) type {
         .pointer => |info| blk: {
             if (info.size == .slice and info.child == u8) break :blk Schema; // string
             if (info.size == .slice) break :blk []const Unwrap(info.child); // array
+            // A single-item pointer is transparent in JSON (and lets a
+            // union refer to itself).
+            if (info.size == .one) break :blk *const Unwrap(info.child);
             @compileError("zig-jsonschema: unsupported pointer type " ++ @typeName(Schema));
         },
         // Structs without any `Field()` label are already plain: keep the
@@ -218,19 +273,44 @@ pub fn Unwrap(comptime Schema: type) type {
                 " cannot contain Field() labels (Zig cannot build a self-referential unwrapped type); use plain field types in it")
         else
             unwrapStruct(Schema),
+        .@"union" => blk: {
+            requireTaggedUnion(Schema);
+            if (!hasLabels(Schema, &.{})) break :blk Schema;
+            if (reaches(Schema, Schema, &.{})) @compileError("zig-jsonschema: recursive type " ++ @typeName(Schema) ++
+                " cannot contain Field() labels (Zig cannot build a self-referential unwrapped type); use plain field types in it");
+            break :blk unwrapUnion(Schema);
+        },
         else => @compileError("zig-jsonschema: unsupported type " ++ @typeName(Schema)),
     };
+}
+
+/// The same union with every payload type unwrapped (and the same tag enum).
+fn unwrapUnion(comptime Schema: type) type {
+    const info = @typeInfo(Schema).@"union";
+    var names: [info.fields.len][]const u8 = undefined;
+    var types: [info.fields.len]type = undefined;
+    for (info.fields, 0..) |f, i| {
+        names[i] = f.name;
+        types[i] = Unwrap(f.type);
+    }
+    return @Union(.auto, info.tag_type, &names, &types, &@splat(.{}));
 }
 
 /// Types `T` refers to that `Unwrap` descends into.
 fn containedTypes(comptime T: type) []const type {
     return switch (@typeInfo(T)) {
         .optional => |o| &.{o.child},
-        .pointer => |p| if (p.size == .slice and p.child != u8) &.{p.child} else &.{},
+        .pointer => |p| if ((p.size == .slice and p.child != u8) or p.size == .one) &.{p.child} else &.{},
         .@"struct" => |s| blk: {
             if (isField(T)) break :blk &.{T.zjs_inner};
             var types: [s.fields.len]type = undefined;
             for (s.fields, 0..) |f, i| types[i] = f.type;
+            const final = types;
+            break :blk &final;
+        },
+        .@"union" => |u| blk: {
+            var types: [u.fields.len]type = undefined;
+            for (u.fields, 0..) |f, i| types[i] = f.type;
             const final = types;
             break :blk &final;
         },
@@ -342,7 +422,8 @@ pub const SchemaOptions = struct {
     /// generated `$ref`s resolve against. From 2019-09 on it must not have
     /// a non-empty fragment. Generation only.
     id: ?[]const u8 = null,
-    /// JSON Schema version (dialect) to generate. Generation only.
+    /// JSON Schema version (dialect) to generate. `fromJson` follows it
+    /// where the drafts differ: before draft 6, `1.0` is not an integer.
     draft: Draft = .draft2020_12,
     /// Emit `$schema` at the root, so consumers know which dialect the
     /// schema is written in. Generation only.
@@ -351,6 +432,9 @@ pub const SchemaOptions = struct {
     /// every object whose `Field()` does not set `additionalProperties`
     /// explicitly (an explicit setting always wins).
     unknown_fields: UnknownFields = .allow,
+    /// How struct field names are spelled as JSON object keys. Two fields
+    /// must not map to the same key.
+    field_naming: FieldNaming = .as_is,
     /// Emit every named struct type (other than the root) once under
     /// `$defs` (`definitions` before 2019-09) and refer to it with `$ref`,
     /// instead of inlining it at each use. Recursive types are always
@@ -364,6 +448,67 @@ pub const UnknownFields = enum {
     /// Reject them; `"additionalProperties": false` is emitted.
     deny,
 };
+
+/// JSON key spelling of struct field names. Words are split at `_` and at
+/// lower-to-upper case changes, so both `user_id` and `userId` become
+/// `userId` in `.camel_case`. Leading underscores are kept.
+pub const FieldNaming = enum {
+    /// The Zig field name unchanged.
+    as_is,
+    /// `user_id` -> `userId`
+    camel_case,
+    /// `user_id` -> `UserId`
+    pascal_case,
+    /// `userId` -> `user_id`
+    snake_case,
+    /// `user_id` -> `user-id`
+    kebab_case,
+};
+
+/// The JSON key of the field named `name`.
+fn jsonName(comptime name: []const u8, naming: FieldNaming) []const u8 {
+    return switch (naming) {
+        inline else => |n| comptime convertName(name, n),
+    };
+}
+
+fn convertName(comptime name: []const u8, comptime naming: FieldNaming) []const u8 {
+    if (naming == .as_is) return name;
+    @setEvalBranchQuota(10_000);
+    var out: []const u8 = "";
+    var i: usize = 0;
+    while (i < name.len and name[i] == '_') : (i += 1) out = out ++ "_";
+    var word_index: usize = 0;
+    var at_word_start = true;
+    while (i < name.len) : (i += 1) {
+        const c = name[i];
+        if (c == '_') {
+            at_word_start = true;
+            continue;
+        }
+        // `userId`: an upper-case letter after a lower-case one or a digit starts a word.
+        if (std.ascii.isUpper(c) and i > 0 and (std.ascii.isLower(name[i - 1]) or std.ascii.isDigit(name[i - 1]))) {
+            at_word_start = true;
+        }
+        // A new word, unless nothing but leading underscores came before.
+        if (at_word_start and out.len > 0 and out[out.len - 1] != '_') {
+            word_index += 1;
+            switch (naming) {
+                .snake_case => out = out ++ "_",
+                .kebab_case => out = out ++ "-",
+                else => {},
+            }
+        }
+        const capitalize = at_word_start and switch (naming) {
+            .camel_case => word_index > 0,
+            .pascal_case => true,
+            else => false,
+        };
+        out = out ++ &[_]u8{if (capitalize) std.ascii.toUpper(c) else std.ascii.toLower(c)};
+        at_word_start = false;
+    }
+    return out;
+}
 
 fn additionalPropertiesFor(explicit: ?bool, options: SchemaOptions) ?bool {
     return explicit orelse switch (options.unknown_fields) {
@@ -439,7 +584,11 @@ const Gen = struct {
         try gen.refs.put(gen.allocator, type_name, ref);
         // Reserve the slot so definitions keep their order of first use.
         try gen.defs.put(gen.allocator, name, .null);
-        const schema = try buildObjectSchema(T, .{}, gen);
+        const schema = switch (@typeInfo(T)) {
+            .@"struct" => try buildObjectSchema(T, .{}, null, gen),
+            .@"union" => try buildUnionSchema(T, .{}, gen),
+            else => unreachable,
+        };
         try gen.defs.put(gen.allocator, name, schema);
         return ref;
     }
@@ -457,21 +606,24 @@ const Gen = struct {
     }
 };
 
-/// Whether the root of `Schema` (below `Field()` and `?`) is a struct.
+/// Whether the root of `Schema` (below `Field()` and `?`) is a struct or union.
 fn rootIsStruct(comptime Schema: type) bool {
     if (isField(Schema)) return rootIsStruct(Schema.zjs_inner);
     return switch (@typeInfo(Schema)) {
         .optional => |o| rootIsStruct(o.child),
-        .@"struct" => true,
+        .@"struct", .@"union" => true,
         else => false,
     };
 }
 
-/// Whether `T` is a struct with a user-given name (anonymous `struct {}`
-/// literals are always inlined).
+/// Whether `T` is a struct or union with a user-given name (anonymous
+/// `struct {}` / `union(enum) {}` literals are always inlined).
 fn isNamedStruct(comptime T: type) bool {
-    return @typeInfo(T) == .@"struct" and !isField(T) and
-        std.mem.indexOf(u8, @typeName(T), "__struct_") == null;
+    return switch (@typeInfo(T)) {
+        .@"struct" => !isField(T) and std.mem.indexOf(u8, @typeName(T), "__struct_") == null,
+        .@"union" => std.mem.indexOf(u8, @typeName(T), "__union_") == null,
+        else => false,
+    };
 }
 
 /// Turns a fully qualified type name into a definition name by dropping
@@ -535,9 +687,14 @@ fn buildSchemaFor(comptime T: type, constraints: ConstraintsFor(T), gen: *Gen) A
         .pointer => |p| {
             if (p.size == .slice and p.child == u8) return buildStringSchema(constraints, allocator);
             if (p.size == .slice) return buildArraySchema(p.child, constraints, gen);
+            if (p.size == .one) {
+                if (comptime isField(p.child)) return buildSchema(p.child, gen);
+                return buildSchemaFor(p.child, constraints, gen);
+            }
             @compileError("zig-jsonschema: unsupported pointer type " ++ @typeName(T));
         },
         .@"struct" => return buildStructUse(T, constraints, gen),
+        .@"union" => return buildUnionUse(T, constraints, gen),
         else => @compileError("zig-jsonschema: unsupported type " ++ @typeName(T)),
     }
 }
@@ -552,34 +709,112 @@ fn buildStructUse(comptime T: type, constraints: ObjectConstraints, gen: *Gen) A
     }
     // An explicit `additionalProperties` changes the object's shape, which a
     // shared definition cannot express, so such uses are inlined.
-    if (comptime !isNamedStruct(T)) return buildObjectSchema(T, constraints, gen);
+    if (comptime !isNamedStruct(T)) return buildObjectSchema(T, constraints, null, gen);
     if (constraints.additionalProperties != null) return buildInlineStruct(T, constraints, gen);
     const ref = (try gen.refFor(T)) orelse return buildInlineStruct(T, constraints, gen);
+    var obj = try refWithSiblings(ref, constraints.title, constraints.description, allocator);
+    if (obj.object.get("allOf") == null and (constraints.minProperties != null or constraints.maxProperties != null)) {
+        obj = try wrapInAllOf(obj, allocator);
+    }
+    if (constraints.minProperties) |v| try obj.object.put(allocator, "minProperties", .{ .integer = @intCast(v) });
+    if (constraints.maxProperties) |v| try obj.object.put(allocator, "maxProperties", .{ .integer = @intCast(v) });
+    return obj;
+}
 
+/// `{"$ref": ref}`, wrapped in `allOf` when annotations are layered on top:
+/// drafts up to 7 ignore keywords next to `$ref` (the `allOf` form is
+/// valid in every draft).
+fn refWithSiblings(ref: []const u8, title: ?[]const u8, description: ?[]const u8, allocator: Allocator) Allocator.Error!std.json.Value {
     var ref_obj: std.json.ObjectMap = .empty;
     try ref_obj.put(allocator, "$ref", .{ .string = ref });
-    const has_siblings = constraints.title != null or constraints.description != null or
-        constraints.minProperties != null or constraints.maxProperties != null;
-    if (!has_siblings) return .{ .object = ref_obj };
+    if (title == null and description == null) return .{ .object = ref_obj };
+    var obj = try wrapInAllOf(.{ .object = ref_obj }, allocator);
+    if (title) |v| try obj.object.put(allocator, "title", .{ .string = v });
+    if (description) |v| try obj.object.put(allocator, "description", .{ .string = v });
+    return obj;
+}
 
-    // Drafts up to 7 ignore keywords next to `$ref`, so wrap it in `allOf`
-    // (valid in every draft).
+fn wrapInAllOf(schema: std.json.Value, allocator: Allocator) Allocator.Error!std.json.Value {
     var all_of: std.json.Array = .init(allocator);
-    try all_of.append(.{ .object = ref_obj });
+    try all_of.append(schema);
     var obj: std.json.ObjectMap = .empty;
     try obj.put(allocator, "allOf", .{ .array = all_of });
-    if (constraints.title) |v| try obj.put(allocator, "title", .{ .string = v });
-    if (constraints.description) |v| try obj.put(allocator, "description", .{ .string = v });
-    if (constraints.minProperties) |v| try obj.put(allocator, "minProperties", .{ .integer = @intCast(v) });
-    if (constraints.maxProperties) |v| try obj.put(allocator, "maxProperties", .{ .integer = @intCast(v) });
     return .{ .object = obj };
 }
 
 fn buildInlineStruct(comptime T: type, constraints: ObjectConstraints, gen: *Gen) Allocator.Error!std.json.Value {
     try gen.inlining.put(gen.allocator, @typeName(T), {});
     defer _ = gen.inlining.remove(@typeName(T));
-    return buildObjectSchema(T, constraints, gen);
+    return buildObjectSchema(T, constraints, null, gen);
 }
+
+/// Schema for one use of union `T`: a `$ref` to its shared definition, or
+/// the union inlined.
+fn buildUnionUse(comptime T: type, constraints: UnionConstraints, gen: *Gen) Allocator.Error!std.json.Value {
+    if (gen.inline_next_struct) {
+        gen.inline_next_struct = false;
+        return buildInlineUnion(T, constraints, gen);
+    }
+    if (comptime !isNamedStruct(T)) return buildUnionSchema(T, constraints, gen);
+    const ref = (try gen.refFor(T)) orelse return buildInlineUnion(T, constraints, gen);
+    return refWithSiblings(ref, constraints.title, constraints.description, gen.allocator);
+}
+
+fn buildInlineUnion(comptime T: type, constraints: UnionConstraints, gen: *Gen) Allocator.Error!std.json.Value {
+    try gen.inlining.put(gen.allocator, @typeName(T), {});
+    defer _ = gen.inlining.remove(@typeName(T));
+    return buildUnionSchema(T, constraints, gen);
+}
+
+/// `oneOf` with one branch per variant (see `UnionConstraints`).
+fn buildUnionSchema(comptime T: type, constraints: UnionConstraints, gen: *Gen) Allocator.Error!std.json.Value {
+    const allocator = gen.allocator;
+    const discriminator = comptime discriminatorOf(T);
+    var branches: std.json.Array = .init(allocator);
+    inline for (@typeInfo(T).@"union".fields) |f| {
+        const name = jsonName(f.name, gen.options.field_naming);
+        const Payload = stripField(f.type);
+        if (discriminator) |key| {
+            // `{"<key>": "<name>", ...payload fields}`
+            const tag: ObjectTag = .{ .key = key, .value = name };
+            if (Payload == void) {
+                try branches.append(try buildObjectSchema(struct {}, .{}, tag, gen));
+            } else {
+                const c: ObjectConstraints = if (comptime isField(f.type)) f.type.zjs_constraints else .{};
+                try gen.inlining.put(allocator, @typeName(Payload), {});
+                defer _ = gen.inlining.remove(@typeName(Payload));
+                try branches.append(try buildObjectSchema(Payload, c, tag, gen));
+            }
+        } else {
+            // `{"<name>": <payload>}`, a void payload being `{}`.
+            const payload: std.json.Value = if (Payload == void) blk: {
+                var empty: std.json.ObjectMap = .empty;
+                try empty.put(allocator, "type", .{ .string = "object" });
+                try empty.put(allocator, "maxProperties", .{ .integer = 0 });
+                break :blk .{ .object = empty };
+            } else try buildSchema(f.type, gen);
+            var props: std.json.ObjectMap = .empty;
+            try props.put(allocator, name, payload);
+            var required: std.json.Array = .init(allocator);
+            try required.append(.{ .string = name });
+            var branch: std.json.ObjectMap = .empty;
+            try branch.put(allocator, "type", .{ .string = "object" });
+            try branch.put(allocator, "properties", .{ .object = props });
+            try branch.put(allocator, "required", .{ .array = required });
+            // Exactly one key: the variant's.
+            try branch.put(allocator, "additionalProperties", .{ .bool = false });
+            try branches.append(.{ .object = branch });
+        }
+    }
+    var obj: std.json.ObjectMap = .empty;
+    if (constraints.title) |v| try obj.put(allocator, "title", .{ .string = v });
+    if (constraints.description) |v| try obj.put(allocator, "description", .{ .string = v });
+    try obj.put(allocator, "oneOf", .{ .array = branches });
+    return .{ .object = obj };
+}
+
+/// The discriminator property an internally tagged union adds to a variant's object.
+const ObjectTag = struct { key: []const u8, value: []const u8 };
 
 fn buildNumberSchema(comptime T: type, constraints: NumberConstraints, gen: *Gen) Allocator.Error!std.json.Value {
     const allocator = gen.allocator;
@@ -594,18 +829,107 @@ fn buildNumberSchema(comptime T: type, constraints: NumberConstraints, gen: *Gen
     if (constraints.title) |v| try obj.put(allocator, "title", .{ .string = v });
     if (constraints.description) |v| try obj.put(allocator, "description", .{ .string = v });
     if (constraints.default) |v| try obj.put(allocator, "default", .{ .float = v });
+
+    // The type's own range applies unless a user bound is at least as strict,
+    // so that the schema rejects what `fromJson` cannot store (e.g. 300 for u8).
+    const range = typeRange(T);
+    var lower: SideBounds = .{ .inclusive = floatBound(constraints.minimum), .exclusive = floatBound(constraints.exclusiveMinimum) };
+    var upper: SideBounds = .{ .inclusive = floatBound(constraints.maximum), .exclusive = floatBound(constraints.exclusiveMaximum) };
+    if (range) |r| {
+        if (!lower.atLeast(r.min, .lower)) lower = .{ .inclusive = r.min };
+        if (!upper.atLeast(r.max, .upper)) upper = .{ .inclusive = r.max };
+    }
+
     if (gen.options.draft == .draft4) {
         // Draft 4 has a single bound per side, made exclusive by a boolean.
-        try putDraft4Bound(&obj, allocator, "minimum", "exclusiveMinimum", constraints.minimum, constraints.exclusiveMinimum, .lower);
-        try putDraft4Bound(&obj, allocator, "maximum", "exclusiveMaximum", constraints.maximum, constraints.exclusiveMaximum, .upper);
+        try putDraft4Bound(&obj, allocator, "minimum", "exclusiveMinimum", lower, .lower);
+        try putDraft4Bound(&obj, allocator, "maximum", "exclusiveMaximum", upper, .upper);
     } else {
-        if (constraints.minimum) |v| try obj.put(allocator, "minimum", .{ .float = v });
-        if (constraints.maximum) |v| try obj.put(allocator, "maximum", .{ .float = v });
-        if (constraints.exclusiveMinimum) |v| try obj.put(allocator, "exclusiveMinimum", .{ .float = v });
-        if (constraints.exclusiveMaximum) |v| try obj.put(allocator, "exclusiveMaximum", .{ .float = v });
+        if (lower.inclusive) |b| try obj.put(allocator, "minimum", try b.toJson(allocator));
+        if (upper.inclusive) |b| try obj.put(allocator, "maximum", try b.toJson(allocator));
+        if (lower.exclusive) |b| try obj.put(allocator, "exclusiveMinimum", try b.toJson(allocator));
+        if (upper.exclusive) |b| try obj.put(allocator, "exclusiveMaximum", try b.toJson(allocator));
     }
     if (constraints.multipleOf) |v| try obj.put(allocator, "multipleOf", .{ .float = v });
     return .{ .object = obj };
+}
+
+/// A numeric bound: exact for integer type ranges, f64 for user bounds.
+const Bound = union(enum) {
+    int: i256,
+    float: f64,
+
+    fn order(a: Bound, b: Bound) std.math.Order {
+        return switch (a) {
+            .int => |x| switch (b) {
+                .int => |y| std.math.order(x, y),
+                .float => |y| validator.compareIntFloat(x, y),
+            },
+            .float => |x| switch (b) {
+                .int => |y| validator.compareIntFloat(y, x).invert(),
+                .float => |y| std.math.order(x, y),
+            },
+        };
+    }
+
+    fn toJson(b: Bound, allocator: Allocator) Allocator.Error!std.json.Value {
+        return switch (b) {
+            // std.json writes floats positionally: keep 3.4e38 readable.
+            .float => |f| if (@abs(f) >= 1e21)
+                .{ .number_string = try std.fmt.allocPrint(allocator, "{e}", .{f}) }
+            else
+                .{ .float = f },
+            .int => |i| if (std.math.cast(i64, i)) |small|
+                .{ .integer = small }
+            else
+                // Beyond i64 (e.g. the u64 maximum): written out verbatim.
+                .{ .number_string = try std.fmt.allocPrint(allocator, "{d}", .{i}) },
+        };
+    }
+};
+
+fn floatBound(v: ?f64) ?Bound {
+    return if (v) |f| .{ .float = f } else null;
+}
+
+const SideBounds = struct {
+    inclusive: ?Bound = null,
+    exclusive: ?Bound = null,
+
+    /// Whether these bounds already exclude everything beyond `limit`.
+    fn atLeast(s: SideBounds, limit: Bound, comptime side: Side) bool {
+        inline for (.{ s.inclusive, s.exclusive }) |maybe| {
+            if (maybe) |b| if (side.stricterOrEqual(b, limit)) return true;
+        }
+        return false;
+    }
+};
+
+const Side = enum {
+    lower,
+    upper,
+
+    fn stricterOrEqual(side: Side, a: Bound, b: Bound) bool {
+        const ord = a.order(b);
+        return ord == .eq or ord == if (side == .lower) std.math.Order.gt else std.math.Order.lt;
+    }
+};
+
+/// The range of values `T` can hold, for types narrower than a JSON number:
+/// every integer type, and floats narrower than f64 (larger JSON numbers
+/// would overflow to infinity).
+fn typeRange(comptime T: type) ?struct { min: Bound, max: Bound } {
+    return switch (@typeInfo(T)) {
+        .int => |i| blk: {
+            if (i.bits > 255) @compileError("zig-jsonschema: integer types wider than 255 bits are not supported");
+            break :blk .{ .min = .{ .int = std.math.minInt(T) }, .max = .{ .int = std.math.maxInt(T) } };
+        },
+        .float => |f| if (f.bits < 64)
+            .{ .min = .{ .float = -std.math.floatMax(T) }, .max = .{ .float = std.math.floatMax(T) } }
+        else
+            null,
+        else => null,
+    };
 }
 
 /// Emits the stricter of an inclusive and an exclusive bound in draft 4
@@ -615,20 +939,19 @@ fn putDraft4Bound(
     allocator: Allocator,
     comptime bound_key: []const u8,
     comptime exclusive_key: []const u8,
-    inclusive: ?f64,
-    exclusive: ?f64,
-    comptime side: enum { lower, upper },
+    bounds: SideBounds,
+    comptime side: Side,
 ) Allocator.Error!void {
     const use_exclusive = blk: {
-        const ex = exclusive orelse break :blk false;
-        const in = inclusive orelse break :blk true;
-        break :blk if (side == .lower) ex >= in else ex <= in;
+        const ex = bounds.exclusive orelse break :blk false;
+        const in = bounds.inclusive orelse break :blk true;
+        break :blk side.stricterOrEqual(ex, in);
     };
     if (use_exclusive) {
-        try obj.put(allocator, bound_key, .{ .float = exclusive.? });
+        try obj.put(allocator, bound_key, try bounds.exclusive.?.toJson(allocator));
         try obj.put(allocator, exclusive_key, .{ .bool = true });
-    } else if (inclusive) |in| {
-        try obj.put(allocator, bound_key, .{ .float = in });
+    } else if (bounds.inclusive) |in| {
+        try obj.put(allocator, bound_key, try in.toJson(allocator));
     }
 }
 
@@ -666,17 +989,32 @@ fn buildArraySchema(comptime Item: type, constraints: ArrayConstraints, gen: *Ge
     return .{ .object = obj };
 }
 
-fn buildObjectSchema(comptime StructT: type, constraints: ObjectConstraints, gen: *Gen) Allocator.Error!std.json.Value {
+fn buildObjectSchema(comptime StructT: type, constraints: ObjectConstraints, tag: ?ObjectTag, gen: *Gen) Allocator.Error!std.json.Value {
     const allocator = gen.allocator;
     const info = @typeInfo(StructT).@"struct";
     var props: std.json.ObjectMap = .empty;
     var required: std.json.Array = .init(allocator);
 
+    if (tag) |t| {
+        // Draft 4 has no `const`.
+        var values: std.json.Array = .init(allocator);
+        try values.append(.{ .string = t.value });
+        var tag_schema: std.json.ObjectMap = .empty;
+        if (gen.options.draft == .draft4) {
+            try tag_schema.put(allocator, "enum", .{ .array = values });
+        } else {
+            try tag_schema.put(allocator, "const", .{ .string = t.value });
+        }
+        try props.put(allocator, t.key, .{ .object = tag_schema });
+        try required.append(.{ .string = t.key });
+    }
+
     inline for (info.fields) |f| {
+        const name = jsonName(f.name, gen.options.field_naming);
         const field_schema = try buildSchema(f.type, gen);
-        try props.put(allocator, f.name, field_schema);
+        try props.put(allocator, name, field_schema);
         if (!isOptionalField(f)) {
-            try required.append(.{ .string = f.name });
+            try required.append(.{ .string = name });
         }
     }
 
@@ -712,40 +1050,52 @@ pub fn validate(
     allocator: Allocator,
     errors: *std.ArrayList(ValidationError),
 ) Allocator.Error!void {
-    try validatePath(Schema, value, "", allocator, errors);
+    try validatePath(Schema, value, "", .as_is, allocator, errors);
 }
 
+/// `naming` spells the field names in error paths.
 fn validatePath(
     comptime Schema: type,
     value: Unwrap(Schema),
     path: []const u8,
+    naming: FieldNaming,
     allocator: Allocator,
     errors: *std.ArrayList(ValidationError),
 ) Allocator.Error!void {
     if (comptime isField(Schema)) {
         try checkConstraints(Schema.zjs_inner, value, Schema.zjs_constraints, path, allocator, errors);
-        try validatePath(Schema.zjs_inner, value, path, allocator, errors);
+        try validatePath(Schema.zjs_inner, value, path, naming, allocator, errors);
         return;
     }
 
     switch (@typeInfo(Schema)) {
         .int, .float, .bool, .@"enum" => {}, // leaf types: constraints (if any) were already applied above
         .optional => |info| {
-            if (value) |inner| try validatePath(info.child, inner, path, allocator, errors);
+            if (value) |inner| try validatePath(info.child, inner, path, naming, allocator, errors);
         },
         .pointer => |info| {
             if (info.size == .slice and info.child == u8) return; // string leaf
+            if (info.size == .one) return validatePath(info.child, value.*, path, naming, allocator, errors);
             for (value, 0..) |elem, i| {
                 const idx_path = try childPath(path, try std.fmt.allocPrint(allocator, "{d}", .{i}), allocator);
-                try validatePath(info.child, elem, idx_path, allocator, errors);
+                try validatePath(info.child, elem, idx_path, naming, allocator, errors);
             }
         },
         .@"struct" => |info| {
             inline for (info.fields) |f| {
-                const child_path = try childPath(path, f.name, allocator);
-                try validatePath(f.type, @field(value, f.name), child_path, allocator, errors);
+                const child_path = try childPath(path, jsonName(f.name, naming), allocator);
+                try validatePath(f.type, @field(value, f.name), child_path, naming, allocator, errors);
             }
         },
+        .@"union" => switch (value) {
+            inline else => |payload, tag| {
+                const name = @tagName(tag);
+                // Internally tagged payload fields sit next to the tag.
+                const payload_path = if (comptime discriminatorOf(Schema) != null) path else try childPath(path, jsonName(name, naming), allocator);
+                try validatePath(@FieldType(Schema, name), payload, payload_path, naming, allocator, errors);
+            },
+        },
+        .void => {},
         else => @compileError("zig-jsonschema: unsupported type " ++ @typeName(Schema)),
     }
 }
@@ -771,13 +1121,16 @@ fn checkConstraints(
         .@"enum" => |e| try checkNumberConstraints(e.tag_type, @intFromEnum(value), constraints, path, allocator, errors),
         .bool => {}, // no assertion keywords for booleans in this MVP
         .pointer => |p| {
-            if (p.size == .slice and p.child == u8) {
+            if (p.size == .one) {
+                try checkConstraints(p.child, value.*, constraints, path, allocator, errors);
+            } else if (p.size == .slice and p.child == u8) {
                 try checkStringConstraints(value, constraints, path, allocator, errors);
             } else {
                 try checkArrayConstraints(p.child, value, constraints, path, allocator, errors);
             }
         },
         .@"struct" => try checkObjectConstraints(Inner, constraints, path, allocator, errors),
+        .@"union" => {}, // annotations only
         else => @compileError("zig-jsonschema: unsupported type " ++ @typeName(Inner)),
     }
 }
@@ -840,14 +1193,25 @@ fn checkStringConstraints(
     allocator: Allocator,
     errors: *std.ArrayList(ValidationError),
 ) Allocator.Error!void {
+    // Code points, as JSON Schema counts them (invalid UTF-8: bytes).
+    const len = std.unicode.utf8CountCodepoints(value) catch value.len;
     if (constraints.minLength) |min| {
-        if (value.len < min) try addError(errors, allocator, path, "string length {d} is less than minLength {d}", .{ value.len, min });
+        if (len < min) try addError(errors, allocator, path, "string length {d} is less than minLength {d}", .{ len, min });
     }
     if (constraints.maxLength) |max| {
-        if (value.len > max) try addError(errors, allocator, path, "string length {d} is greater than maxLength {d}", .{ value.len, max });
+        if (len > max) try addError(errors, allocator, path, "string length {d} is greater than maxLength {d}", .{ len, max });
     }
-    // `pattern` is emitted into the schema but not enforced here; see the
-    // doc comment on `StringConstraints.pattern`.
+    if (constraints.pattern) |pattern| {
+        const re = Regex.compile(allocator, pattern) catch |err| switch (err) {
+            error.InvalidRegex => return addError(errors, allocator, path, "invalid pattern \"{s}\"", .{pattern}),
+            else => |e| return e,
+        };
+        const matched = re.isMatch(allocator, value) catch |err| switch (err) {
+            error.RegexLimitExceeded => return addError(errors, allocator, path, "pattern \"{s}\" exceeded the regex step limit", .{pattern}),
+            else => |e| return e,
+        };
+        if (!matched) try addError(errors, allocator, path, "string does not match pattern \"{s}\"", .{pattern});
+    }
 }
 
 fn checkArrayConstraints(
@@ -946,7 +1310,7 @@ pub fn fromJson(
     };
 
     if (decoded) |value| {
-        try validatePath(Schema, value, "", allocator, &errors);
+        try validatePath(Schema, value, "", options.field_naming, allocator, &errors);
         return .{ .value = if (errors.items.len == 0) value else null, .errors = errors };
     }
     return .{ .value = null, .errors = errors };
@@ -985,44 +1349,34 @@ fn decodeValue(
                 },
             }
         },
-        .@"enum" => |e| {
-            switch (value) {
-                .integer => |i| {
-                    const tag = std.math.cast(e.tag_type, i) orelse {
-                        try addError(errors, allocator, path, "{d} does not fit in {s}", .{ i, @typeName(Schema) });
-                        return error.Invalid;
-                    };
-                    return @enumFromInt(tag);
-                },
-                else => {
-                    try addError(errors, allocator, path, "expected an integer, got {s}", .{@tagName(value)});
-                    return error.Invalid;
-                },
-            }
-        },
-        .int => {
-            switch (value) {
-                .integer => |i| return std.math.cast(Schema, i) orelse {
-                    try addError(errors, allocator, path, "{d} does not fit in {s}", .{ i, @typeName(Schema) });
-                    return error.Invalid;
-                },
-                else => {
-                    try addError(errors, allocator, path, "expected an integer, got {s}", .{@tagName(value)});
-                    return error.Invalid;
-                },
-            }
-        },
+        .@"enum" => |e| return @enumFromInt(try decodeInt(e.tag_type, Schema, value, path, options, allocator, errors)),
+        .int => return decodeInt(Schema, Schema, value, path, options, allocator, errors),
         .float => {
-            switch (value) {
-                .float => |f| return @as(Schema, @floatCast(f)),
-                .integer => |i| return @as(Schema, @floatFromInt(i)),
+            const f: f64 = switch (value) {
+                .float => |f| f,
+                .integer => |i| @floatFromInt(i),
+                // Integers beyond i64 and literals beyond f64 (such as 1e400).
+                .number_string => |s| std.fmt.parseFloat(f64, s) catch unreachable,
                 else => {
                     try addError(errors, allocator, path, "expected a number, got {s}", .{@tagName(value)});
                     return error.Invalid;
                 },
+            };
+            // The schema bounds floats narrower than f64 by their range
+            // (`typeRange`). Wider ones take any JSON number, like std.json
+            // (a literal beyond f64 such as 1e400 becomes infinity).
+            if ((comptime typeRange(Schema) != null) and !(@abs(f) <= std.math.floatMax(Schema))) {
+                try addError(errors, allocator, path, "{s} does not fit in {s}", .{ try numberText(value, allocator), @typeName(Schema) });
+                return error.Invalid;
             }
+            return @as(Schema, @floatCast(f));
         },
         .pointer => |info| {
+            if (info.size == .one) {
+                const ptr = try allocator.create(Unwrap(info.child));
+                ptr.* = try decodeValue(info.child, value, path, additional, options, allocator, errors);
+                return ptr;
+            }
             if (info.size == .slice and info.child == u8) {
                 switch (value) {
                     .string => |s| return try allocator.dupe(u8, s),
@@ -1066,12 +1420,13 @@ fn decodeValue(
             var result: Unwrap(Schema) = undefined;
             var any_failed = false;
             if (additionalPropertiesFor(additional, options) == false) {
-                any_failed = try reportAdditionalProperties(Schema, value.object, path, allocator, errors);
+                any_failed = try reportAdditionalProperties(Schema, value.object, path, options.field_naming, allocator, errors);
             }
 
             inline for (info.fields) |f| {
-                const child_path = try childPath(path, f.name, allocator);
-                if (value.object.get(f.name)) |sub_value| {
+                const name = jsonName(f.name, options.field_naming);
+                const child_path = try childPath(path, name, allocator);
+                if (value.object.get(name)) |sub_value| {
                     if (decodeValue(f.type, sub_value, child_path, null, options, allocator, errors)) |decoded| {
                         @field(result, f.name) = decoded;
                     } else |err| switch (err) {
@@ -1091,14 +1446,132 @@ fn decodeValue(
             if (any_failed) return error.Invalid;
             return result;
         },
+        .@"union" => return decodeUnion(Schema, value, path, options, allocator, errors),
+        .void => {
+            if (value != .object or value.object.count() != 0) {
+                try addError(errors, allocator, path, "expected an empty object", .{});
+                return error.Invalid;
+            }
+        },
         else => @compileError("zig-jsonschema: unsupported type " ++ @typeName(Schema)),
     }
+}
+
+fn decodeUnion(
+    comptime Schema: type,
+    value: std.json.Value,
+    path: []const u8,
+    options: SchemaOptions,
+    allocator: Allocator,
+    errors: *std.ArrayList(ValidationError),
+) DecodeError!Unwrap(Schema) {
+    const fields = @typeInfo(Schema).@"union".fields;
+    if (value != .object) {
+        try addError(errors, allocator, path, "expected an object, got {s}", .{@tagName(value)});
+        return error.Invalid;
+    }
+    if (comptime discriminatorOf(Schema)) |key| {
+        const tag_path = try childPath(path, key, allocator);
+        const tag_value = value.object.get(key) orelse {
+            try addError(errors, allocator, tag_path, "missing discriminator", .{});
+            return error.Invalid;
+        };
+        if (tag_value != .string) {
+            try addError(errors, allocator, tag_path, "expected a string, got {s}", .{@tagName(tag_value)});
+            return error.Invalid;
+        }
+        inline for (fields) |f| {
+            if (std.mem.eql(u8, jsonName(f.name, options.field_naming), tag_value.string)) {
+                // The payload is the rest of the object.
+                var rest = try value.object.clone(allocator);
+                _ = rest.orderedRemove(key);
+                const Payload = stripField(f.type);
+                if (Payload == void) {
+                    if (additionalPropertiesFor(null, options) == false and rest.count() > 0) {
+                        _ = try reportAdditionalProperties(struct {}, rest, path, options.field_naming, allocator, errors);
+                        return error.Invalid;
+                    }
+                    return @unionInit(Unwrap(Schema), f.name, {});
+                }
+                return @unionInit(Unwrap(Schema), f.name, try decodeValue(f.type, .{ .object = rest }, path, null, options, allocator, errors));
+            }
+        }
+        try addError(errors, allocator, tag_path, "unknown variant \"{s}\"", .{tag_value.string});
+        return error.Invalid;
+    }
+
+    if (value.object.count() != 1) {
+        try addError(errors, allocator, path, "expected an object with exactly one key naming the variant, got {d} keys", .{value.object.count()});
+        return error.Invalid;
+    }
+    const key = value.object.keys()[0];
+    inline for (fields) |f| {
+        const name = jsonName(f.name, options.field_naming);
+        if (std.mem.eql(u8, name, key)) {
+            const payload_path = try childPath(path, name, allocator);
+            return @unionInit(Unwrap(Schema), f.name, try decodeValue(f.type, value.object.values()[0], payload_path, null, options, allocator, errors));
+        }
+    }
+    try addError(errors, allocator, try childPath(path, key, allocator), "unknown variant", .{});
+    return error.Invalid;
+}
+
+/// Decodes a JSON integer into `T` (named `Named` in messages), accepting
+/// exactly what the generated `"type": "integer"` plus the range of `T`
+/// accepts: integer literals of any size, and, from draft 6 on, floats
+/// without a fractional part such as `1.0`.
+fn decodeInt(
+    comptime T: type,
+    comptime Named: type,
+    value: std.json.Value,
+    path: []const u8,
+    options: SchemaOptions,
+    allocator: Allocator,
+    errors: *std.ArrayList(ValidationError),
+) DecodeError!T {
+    const wide: ?i256 = switch (value) {
+        .integer => |i| i,
+        // Only integer literals beyond i64 are kept as strings (anything
+        // else is 1e400-like, i.e. not an integer).
+        .number_string => |s| if (std.mem.indexOfAny(u8, s, ".eE") != null) null else std.fmt.parseInt(i256, s, 10) catch {
+            try addError(errors, allocator, path, "{s} does not fit in {s}", .{ s, @typeName(Named) });
+            return error.Invalid;
+        },
+        // Draft 4 predates "1.0 is an integer".
+        .float => |f| if (options.draft != .draft4 and @floor(f) == f)
+            if (@abs(f) < 0x1p255) validator.integralToInt(f) else {
+                try addError(errors, allocator, path, "{d} does not fit in {s}", .{ f, @typeName(Named) });
+                return error.Invalid;
+            }
+        else
+            null,
+        else => null,
+    };
+    const i = wide orelse {
+        try addError(errors, allocator, path, "expected an integer, got {s}", .{try numberText(value, allocator)});
+        return error.Invalid;
+    };
+    return std.math.cast(T, i) orelse {
+        try addError(errors, allocator, path, "{d} does not fit in {s}", .{ i, @typeName(Named) });
+        return error.Invalid;
+    };
+}
+
+/// The number itself for numbers, or the JSON type name otherwise (for error messages).
+fn numberText(value: std.json.Value, allocator: Allocator) Allocator.Error![]const u8 {
+    return switch (value) {
+        .integer => |i| try std.fmt.allocPrint(allocator, "{d}", .{i}),
+        .float => |f| try std.fmt.allocPrint(allocator, "{d}", .{f}),
+        .number_string => |s| s,
+        else => @tagName(value),
+    };
 }
 
 fn reportAdditionalProperties(
     comptime StructT: type,
     obj: std.json.ObjectMap,
     path: []const u8,
+    naming: FieldNaming,
     allocator: Allocator,
     errors: *std.ArrayList(ValidationError),
 ) Allocator.Error!bool {
@@ -1108,7 +1581,7 @@ fn reportAdditionalProperties(
     while (it.next()) |entry| {
         var known = false;
         inline for (info.fields) |f| {
-            if (std.mem.eql(u8, f.name, entry.key_ptr.*)) known = true;
+            if (std.mem.eql(u8, jsonName(f.name, naming), entry.key_ptr.*)) known = true;
         }
         if (!known) {
             found = true;
@@ -1612,6 +2085,366 @@ test "toSchema output is valid for every draft and matches fromJson" {
             }
         }
     }
+}
+
+test "integer and narrow float ranges agree between toSchema and fromJson" {
+    const Id = enum(u64) { _ };
+    // Every field optional, so each case can set just one of them.
+    const T = struct {
+        small: ?u8,
+        signed: ?i8,
+        big: ?u64,
+        wide: ?i64,
+        /// Looser than u8: the u8 range wins.
+        bounded: Field(?u8, .{ .maximum = 1000 }),
+        strict: Field(?u16, .{ .minimum = 1, .exclusiveMaximum = 10 }),
+        id: ?Id,
+        single: ?f32,
+        double: ?f64,
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cases = [_][]const u8{
+        \\{"small": 255, "signed": -128, "big": 18446744073709551615, "wide": -9223372036854775808}
+        ,
+        \\{"small": 256}
+        ,
+        \\{"small": -1}
+        ,
+        \\{"signed": 128}
+        ,
+        \\{"big": 18446744073709551616}
+        ,
+        \\{"big": -1}
+        ,
+        \\{"wide": 9223372036854775808}
+        ,
+        \\{"wide": -9223372036854775809}
+        ,
+        \\{"bounded": 255}
+        ,
+        \\{"bounded": 300}
+        ,
+        \\{"strict": 0}
+        ,
+        \\{"strict": 9}
+        ,
+        \\{"strict": 10}
+        ,
+        \\{"id": 18446744073709551615}
+        ,
+        \\{"id": 18446744073709551616}
+        ,
+        \\{"small": 1.0}
+        ,
+        \\{"small": 1.5}
+        ,
+        \\{"big": 1e19}
+        ,
+        \\{"big": 1e20}
+        ,
+        \\{"single": 3.4e38}
+        ,
+        \\{"single": 3.5e38}
+        ,
+        \\{"double": 1e308}
+        ,
+        \\{"double": 123456789012345678901234567890}
+        ,
+        \\{"small": 1e400}
+        ,
+        \\{"small": 100000000000000000000000000000000000000000000000000000000000000000000000000000000}
+        ,
+    };
+
+    inline for (std.meta.fields(Draft)) |f| {
+        const options: SchemaOptions = .{ .draft = @enumFromInt(f.value) };
+        var v = Validator.init(std.testing.allocator, .{});
+        defer v.deinit();
+        const generated = try toSchema(T, a, options);
+        try std.testing.expect(try v.isValidSchema(generated));
+        const schema = try v.compile(generated);
+        for (cases) |text| {
+            const decoded = (try fromJson(T, a, text, options)).value != null;
+            const instance = try std.json.parseFromSliceLeaky(std.json.Value, a, text, .{});
+            const valid = try schema.isValid(instance);
+            if (decoded != valid) {
+                std.debug.print("{s} on {s}: fromJson {}, schema {}\n", .{ text, f.name, decoded, valid });
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
+
+    // Spot checks of the expected outcome (draft 2020-12).
+    try std.testing.expect((try fromJson(T, a, "{\"small\": 255}", .{})).value != null);
+    try std.testing.expect((try fromJson(T, a, "{\"small\": 256}", .{})).value == null);
+    try std.testing.expectEqual(@as(?u8, 1), (try fromJson(T, a, "{\"small\": 1.0}", .{})).value.?.small);
+    try std.testing.expect((try fromJson(T, a, "{\"small\": 1.0}", .{ .draft = .draft4 })).value == null);
+    try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), (try fromJson(T, a, "{\"big\": 18446744073709551615}", .{})).value.?.big);
+}
+
+test "string pattern and code point lengths agree between toSchema and fromJson" {
+    const T = struct {
+        zip: Field(?[]const u8, .{ .pattern = "^[0-9]{3}-[0-9]{4}$" }),
+        word: Field(?[]const u8, .{ .pattern = "\\p{Lu}" }),
+        short: Field(?[]const u8, .{ .maxLength = 2 }),
+        long: Field(?[]const u8, .{ .minLength = 2 }),
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cases = [_][]const u8{
+        \\{"zip": "123-4567"}
+        ,
+        \\{"zip": "1234567"}
+        ,
+        \\{"zip": "x123-4567"}
+        ,
+        \\{"word": "abcÉ"}
+        ,
+        \\{"word": "abcé"}
+        ,
+        \\{"short": "éé"}
+        ,
+        \\{"short": "ééé"}
+        ,
+        \\{"short": "🐲🐲"}
+        ,
+        \\{"long": "é"}
+        ,
+        \\{"long": "éa"}
+        ,
+    };
+    var v = Validator.init(std.testing.allocator, .{});
+    defer v.deinit();
+    const schema = try v.compile(try toSchema(T, a, .{}));
+    for (cases) |text| {
+        const instance = try std.json.parseFromSliceLeaky(std.json.Value, a, text, .{});
+        const decoded = (try fromJson(T, a, text, .{})).value != null;
+        if (decoded != try schema.isValid(instance)) {
+            std.debug.print("{s}: fromJson {}\n", .{ text, decoded });
+            return error.TestUnexpectedResult;
+        }
+    }
+    const bad = try fromJson(T, a, "{\"zip\": \"1234567\"}", .{});
+    try std.testing.expectEqualStrings("string does not match pattern \"^[0-9]{3}-[0-9]{4}$\"", bad.errors.items[0].message);
+}
+
+test "field names are converted by field_naming" {
+    const cases = .{
+        .{ "user_id", "user_id", "userId", "UserId", "user_id", "user-id" },
+        .{ "userId", "userId", "userId", "UserId", "user_id", "user-id" },
+        .{ "name", "name", "name", "Name", "name", "name" },
+        .{ "address_2", "address_2", "address2", "Address2", "address_2", "address-2" },
+        .{ "item2Count", "item2Count", "item2Count", "Item2Count", "item2_count", "item2-count" },
+        .{ "_private_key", "_private_key", "_privateKey", "_PrivateKey", "_private_key", "_private-key" },
+    };
+    inline for (cases) |c| {
+        inline for (.{ FieldNaming.as_is, .camel_case, .pascal_case, .snake_case, .kebab_case }, 1..) |naming, i| {
+            try std.testing.expectEqualStrings(c[i], jsonName(c[0], naming));
+        }
+    }
+}
+
+test "field_naming applies to the schema, fromJson keys, unknown keys and error paths alike" {
+    const Address = struct { zip_code: Field([]const u8, .{ .minLength = 1 }) };
+    const User = struct {
+        user_id: u32,
+        display_name: ?[]const u8,
+        home_address: Address,
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const options: SchemaOptions = .{ .field_naming = .camel_case, .unknown_fields = .deny };
+
+    const schema = try toSchema(User, a, options);
+    const props = schema.object.get("properties").?.object;
+    try std.testing.expectEqualStrings("userId", props.keys()[0]);
+    try std.testing.expectEqualStrings("displayName", props.keys()[1]);
+    const address_def = schema.object.get("$defs").?.object.values()[0];
+    try std.testing.expectEqualStrings("zipCode", address_def.object.get("properties").?.object.keys()[0]);
+    try std.testing.expectEqualStrings("userId", schema.object.get("required").?.array.items[0].string);
+
+    const ok = try fromJson(User, a,
+        \\{"userId": 1, "homeAddress": {"zipCode": "100"}}
+    , options);
+    try std.testing.expectEqual(@as(u32, 1), ok.value.?.user_id);
+    try std.testing.expectEqualStrings("100", ok.value.?.home_address.zip_code);
+
+    // Zig spellings are unknown keys now; errors use the JSON spelling.
+    const bad = try fromJson(User, a,
+        \\{"user_id": 1, "homeAddress": {"zipCode": ""}}
+    , options);
+    try std.testing.expect(bad.value == null);
+    var paths: std.ArrayList([]const u8) = .empty;
+    for (bad.errors.items) |e| try paths.append(a, e.path);
+    try std.testing.expectEqual(@as(usize, 2), paths.items.len);
+    try std.testing.expectEqualStrings("user_id", paths.items[0]);
+    try std.testing.expectEqualStrings("userId", paths.items[1]);
+
+    var v = Validator.init(std.testing.allocator, .{});
+    defer v.deinit();
+    const compiled = try v.compile(schema);
+    const texts = [_][]const u8{
+        \\{"userId": 1, "homeAddress": {"zipCode": "100"}}
+        ,
+        \\{"userId": 1, "displayName": null, "homeAddress": {"zipCode": "1"}}
+        ,
+        \\{"user_id": 1, "homeAddress": {"zipCode": "100"}}
+        ,
+        \\{"userId": 1, "homeAddress": {"zip_code": "100"}}
+        ,
+        \\{"userId": 1, "homeAddress": {"zipCode": ""}}
+        ,
+    };
+    for (texts) |text| {
+        const instance = try std.json.parseFromSliceLeaky(std.json.Value, a, text, .{});
+        try std.testing.expectEqual((try fromJson(User, a, text, options)).value != null, try compiled.isValid(instance));
+    }
+}
+
+const union_test_types = struct {
+    const Circle = struct { radius: Field(f64, .{ .exclusiveMinimum = 0 }) };
+    const Rect = struct { width: f64, height: f64 };
+    /// std.json's form: `{"circle": {...}}`.
+    const Shape = union(enum) {
+        circle: Circle,
+        rect: Rect,
+        label: Field([]const u8, .{ .minLength = 1 }),
+        empty,
+    };
+    /// Internally tagged: `{"kind": "circle", ...}`.
+    const TaggedShape = union(enum) {
+        pub const json_discriminator = "kind";
+        circle: Circle,
+        rect: Rect,
+        empty,
+    };
+    /// Recursive through the union.
+    const Expr = union(enum) {
+        num: f64,
+        add: []const Expr,
+        neg: *const Expr,
+    };
+    const Drawing = struct {
+        shape: Shape,
+        tagged: TaggedShape,
+        maybe: ?Shape,
+    };
+};
+
+test "tagged unions: toSchema and fromJson agree in both representations on every draft" {
+    const T = union_test_types;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const base =
+        \\"tagged": {"kind": "empty"}, "maybe": null
+    ;
+    const cases = [_][]const u8{
+        "{\"shape\": {\"circle\": {\"radius\": 1}}, " ++ base ++ "}",
+        "{\"shape\": {\"circle\": {\"radius\": 0}}, " ++ base ++ "}",
+        "{\"shape\": {\"rect\": {\"width\": 1, \"height\": 2}}, " ++ base ++ "}",
+        "{\"shape\": {\"label\": \"x\"}, " ++ base ++ "}",
+        "{\"shape\": {\"label\": \"\"}, " ++ base ++ "}",
+        "{\"shape\": {\"empty\": {}}, " ++ base ++ "}",
+        "{\"shape\": {\"empty\": {\"x\": 1}}, " ++ base ++ "}",
+        "{\"shape\": {}, " ++ base ++ "}",
+        "{\"shape\": {\"circle\": {\"radius\": 1}, \"rect\": {\"width\": 1, \"height\": 2}}, " ++ base ++ "}",
+        "{\"shape\": {\"triangle\": {}}, " ++ base ++ "}",
+        "{\"shape\": \"circle\", " ++ base ++ "}",
+        \\{"shape": {"empty": {}}, "tagged": {"kind": "circle", "radius": 2}, "maybe": {"rect": {"width": 1, "height": 1}}}
+        ,
+        \\{"shape": {"empty": {}}, "tagged": {"kind": "circle", "radius": -2}}
+        ,
+        \\{"shape": {"empty": {}}, "tagged": {"kind": "rect", "width": 1}}
+        ,
+        \\{"shape": {"empty": {}}, "tagged": {"kind": "rect", "width": 1, "height": 1, "extra": true}}
+        ,
+        \\{"shape": {"empty": {}}, "tagged": {"kind": "empty", "extra": true}}
+        ,
+        \\{"shape": {"empty": {}}, "tagged": {"kind": "triangle"}}
+        ,
+        \\{"shape": {"empty": {}}, "tagged": {"kind": 1}}
+        ,
+        \\{"shape": {"empty": {}}, "tagged": {"radius": 1}}
+        ,
+    };
+
+    inline for (std.meta.fields(Draft)) |f| {
+        for ([_]UnknownFields{ .allow, .deny }) |unknown| {
+            for ([_]bool{ true, false }) |reuse| {
+                const options: SchemaOptions = .{ .draft = @enumFromInt(f.value), .unknown_fields = unknown, .reuse_definitions = reuse };
+                var v = Validator.init(std.testing.allocator, .{});
+                defer v.deinit();
+                const generated = try toSchema(T.Drawing, a, options);
+                try std.testing.expect(try v.isValidSchema(generated));
+                const schema = try v.compile(generated);
+                for (cases) |text| {
+                    const decoded = (try fromJson(T.Drawing, a, text, options)).value != null;
+                    const instance = try std.json.parseFromSliceLeaky(std.json.Value, a, text, .{});
+                    const valid = try schema.isValid(instance);
+                    if (decoded != valid) {
+                        std.debug.print("{s} ({s}, {t}, reuse={}): fromJson {}, schema {}\n", .{ text, f.name, unknown, reuse, decoded, valid });
+                        return error.TestUnexpectedResult;
+                    }
+                }
+            }
+        }
+    }
+
+    const ok = (try fromJson(T.Drawing, a,
+        \\{"shape": {"circle": {"radius": 1.5}}, "tagged": {"kind": "rect", "width": 2, "height": 3}, "maybe": {"empty": {}}}
+    , .{})).value.?;
+    try std.testing.expectEqual(@as(f64, 1.5), ok.shape.circle.radius);
+    try std.testing.expectEqual(@as(f64, 3), ok.tagged.rect.height);
+    try std.testing.expect(ok.maybe.? == .empty);
+
+    // Error paths follow the JSON layout of each representation.
+    const bad = try fromJson(T.Drawing, a,
+        \\{"shape": {"circle": {"radius": 0}}, "tagged": {"kind": "circle", "radius": 0}}
+    , .{});
+    try std.testing.expectEqual(@as(usize, 2), bad.errors.items.len);
+    try std.testing.expectEqualStrings("shape.circle.radius", bad.errors.items[0].path);
+    try std.testing.expectEqualStrings("tagged.radius", bad.errors.items[1].path);
+}
+
+test "recursive unions are shared through definitions" {
+    const T = union_test_types;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const Program = struct { body: T.Expr };
+    const shared = try toSchema(Program, a, .{});
+    const body = shared.object.get("properties").?.object.get("body").?.object;
+    try std.testing.expectEqualStrings("#/$defs/Expr", body.get("$ref").?.string);
+
+    const cases = [_][]const u8{
+        \\{"body": {"add": [{"num": 1}, {"neg": {"num": 2}}, {"add": []}]}}
+        ,
+        \\{"body": {"add": [{"num": 1}, {"neg": {"num": "x"}}]}}
+        ,
+        \\{"body": {"neg": {"add": [{"mul": 1}]}}}
+        ,
+    };
+    // With reuse off the first use is inlined; recursion still goes through $defs.
+    for ([_]bool{ true, false }) |reuse| {
+        var v = Validator.init(std.testing.allocator, .{});
+        defer v.deinit();
+        const compiled = try v.compile(try toSchema(Program, a, .{ .reuse_definitions = reuse }));
+        for (cases) |text| {
+            const instance = try std.json.parseFromSliceLeaky(std.json.Value, a, text, .{});
+            try std.testing.expectEqual((try fromJson(Program, a, text, .{})).value != null, try compiled.isValid(instance));
+        }
+    }
+    const decoded = (try fromJson(Program, a, cases[0], .{})).value.?;
+    try std.testing.expectEqual(@as(f64, 2), decoded.body.add[1].neg.num);
 }
 
 test "toSchema makes optional types nullable" {

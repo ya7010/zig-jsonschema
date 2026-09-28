@@ -1,0 +1,164 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "shape": {
+      "$ref": "#/definitions/Shape"
+    },
+    "tagged": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/TaggedShape"
+        }
+      ],
+      "description": "Tagged by kind"
+    },
+    "maybe": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Shape"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "required": [
+    "shape",
+    "tagged"
+  ],
+  "definitions": {
+    "Shape": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "circle": {
+              "$ref": "#/definitions/Circle"
+            }
+          },
+          "required": [
+            "circle"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "rect": {
+              "$ref": "#/definitions/Rect"
+            }
+          },
+          "required": [
+            "rect"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "label": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "label"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "empty": {
+              "type": "object",
+              "maxProperties": 0
+            }
+          },
+          "required": [
+            "empty"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "Circle": {
+      "type": "object",
+      "properties": {
+        "radius": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        }
+      },
+      "required": [
+        "radius"
+      ]
+    },
+    "Rect": {
+      "type": "object",
+      "properties": {
+        "width": {
+          "type": "number"
+        },
+        "height": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "width",
+        "height"
+      ]
+    },
+    "TaggedShape": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "circle"
+            },
+            "radius": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            }
+          },
+          "required": [
+            "kind",
+            "radius"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "rect"
+            },
+            "width": {
+              "type": "number"
+            },
+            "height": {
+              "type": "number"
+            }
+          },
+          "required": [
+            "kind",
+            "width",
+            "height"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "empty"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    }
+  }
+}

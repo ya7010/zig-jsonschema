@@ -16,7 +16,9 @@
       "items": {
         "type": "array",
         "items": {
-          "type": "integer"
+          "type": "integer",
+          "minimum": -2147483648,
+          "maximum": 2147483647
         }
       }
     },
@@ -25,7 +27,9 @@
       "maxItems": 10,
       "uniqueItems": true,
       "items": {
-        "type": "integer"
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 18446744073709551615
       }
     }
   },

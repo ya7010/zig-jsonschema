@@ -245,3 +245,49 @@ test "with_id: a root $id (id in draft 4) that the $refs resolve against" {
         billing: ?Address,
     }, .{ .id = "https://example.com/schemas/order.json" });
 }
+
+const Circle = struct { radius: Field(f64, .{ .exclusiveMinimum = 0 }) };
+const Rect = struct { width: f64, height: f64 };
+
+/// Externally tagged, as std.json writes unions: `{"circle": {...}}`.
+const Shape = union(enum) {
+    circle: Circle,
+    rect: Rect,
+    label: Field([]const u8, .{ .minLength = 1 }),
+    empty,
+};
+
+/// Internally tagged: `{"kind": "circle", "radius": 1}`.
+const TaggedShape = union(enum) {
+    pub const json_discriminator = "kind";
+    circle: Circle,
+    rect: Rect,
+    empty,
+};
+
+test "unions: external and internal tagging, void variants, optional unions" {
+    try checkCase("unions", struct {
+        shape: Shape,
+        tagged: Field(TaggedShape, .{ .description = "Tagged by kind" }),
+        maybe: ?Shape,
+    });
+}
+
+const Expr = union(enum) {
+    num: f64,
+    add: []const Expr,
+    neg: *const Expr,
+};
+
+test "recursive_union: a union that refers to itself" {
+    try checkCase("recursive_union", struct { body: Expr });
+}
+
+test "field_naming: camelCase keys for fields and union variants" {
+    try checkCaseWith("field_naming", struct {
+        user_id: u32,
+        display_name: ?[]const u8,
+        home_address: Address,
+        last_event: union(enum) { signed_in: struct { at_time: i64 }, signed_out },
+    }, .{ .field_naming = .camel_case });
+}

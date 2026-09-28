@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2019-09/schema",
+  "type": "object",
+  "properties": {
+    "userId": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295
+    },
+    "displayName": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "homeAddress": {
+      "$ref": "#/$defs/Address"
+    },
+    "lastEvent": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "signedIn": {
+              "type": "object",
+              "properties": {
+                "atTime": {
+                  "type": "integer",
+                  "minimum": -9223372036854775808,
+                  "maximum": 9223372036854775807
+                }
+              },
+              "required": [
+                "atTime"
+              ]
+            }
+          },
+          "required": [
+            "signedIn"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "signedOut": {
+              "type": "object",
+              "maxProperties": 0
+            }
+          },
+          "required": [
+            "signedOut"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    }
+  },
+  "required": [
+    "userId",
+    "homeAddress",
+    "lastEvent"
+  ],
+  "$defs": {
+    "Address": {
+      "type": "object",
+      "properties": {
+        "street": {
+          "type": "string",
+          "minLength": 1
+        },
+        "zip": {
+          "type": "string",
+          "pattern": "^[0-9]{3}-[0-9]{4}$"
+        }
+      },
+      "required": [
+        "street",
+        "zip"
+      ]
+    }
+  }
+}

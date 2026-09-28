@@ -3,25 +3,32 @@
   "type": "object",
   "properties": {
     "id": {
-      "type": "integer"
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18446744073709551615
     },
     "owner": {
       "type": "integer",
       "description": "Owner account",
-      "minimum": 1
+      "minimum": 1,
+      "maximum": 18446744073709551615
     },
     "members": {
       "type": "array",
       "uniqueItems": true,
       "items": {
-        "type": "integer"
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 18446744073709551615
       }
     },
     "parent": {
       "type": [
         "integer",
         "null"
-      ]
+      ],
+      "minimum": 0,
+      "maximum": 18446744073709551615
     }
   },
   "required": [

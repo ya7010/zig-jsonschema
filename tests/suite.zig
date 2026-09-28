@@ -7,8 +7,12 @@
 //!   (with `format` asserted for `optional/format/`).
 //! - Remote documents in `remotes/` are registered under
 //!   `http://localhost:1234/...`, as the suite expects.
-//! - Every case is checked through both `isValid` and `validate`, which must
-//!   agree (and `validate` must report at least one error when invalid).
+//! - Every case is checked through `isValid`, `validate` and every
+//!   `output` format, which must agree (and report at least one error when
+//!   invalid). Each output must also be valid against the official output
+//!   schema.
+//! - The `output-tests` (2019-09 and 2020-12) check the content of the
+//!   `basic` output against the schemas they give.
 //!
 //! Run with `zig build test-suite`; add `-Dsuite-verbose` to list every
 //! failing case.
@@ -31,6 +35,8 @@ const drafts = [_]struct { dir: []const u8, draft: js.Draft }{
 
 const Remote = struct { url: []const u8, value: Value };
 
+const output_drafts = [_][]const u8{ "draft2019-09", "draft2020-12" };
+
 const Stats = struct {
     passed: usize = 0,
     failed: usize = 0,
@@ -43,6 +49,9 @@ const Suite = struct {
     root: Dir,
     out: *Io.Writer,
     remotes: []const Remote = &.{},
+    /// The official output schemas, for checking every output.
+    output_validator: *js.Validator = undefined,
+    output_schema: js.CompiledSchema = undefined,
     /// Failure lines printed so far (capped unless verbose).
     printed: usize = 0,
 };
@@ -69,6 +78,17 @@ pub fn main(init: std.process.Init) !void {
     defer s.root.close(io);
     s.remotes = try loadRemotes(&s);
 
+    var output_validator = js.Validator.init(gpa, .{});
+    defer output_validator.deinit();
+    for (output_drafts) |dir| {
+        const path = try std.fmt.allocPrint(s.arena, "output-tests/{s}/output-schema.json", .{dir});
+        const text = try s.root.readFileAlloc(io, path, s.arena, .limited(1 << 20));
+        const doc = try std.json.parseFromSliceLeaky(Value, s.arena, text, .{});
+        try output_validator.addDocument(doc.object.get("$id").?.string, doc);
+    }
+    s.output_validator = &output_validator;
+    s.output_schema = try output_validator.compileUri("https://json-schema.org/draft/2020-12/output/schema");
+
     var total_failed: usize = 0;
     var total: usize = 0;
     for (drafts) |d| {
@@ -94,6 +114,15 @@ pub fn main(init: std.process.Init) !void {
         });
         total_failed += required.failed + optional.failed;
         total += required.passed + required.failed + optional.passed + optional.failed;
+    }
+
+    for (output_drafts) |dir| {
+        var stats: Stats = .{};
+        const sub = try std.fmt.allocPrint(s.arena, "output-tests/{s}/content", .{dir});
+        for (try listJson(&s, sub)) |name| try runOutputFile(&s, dir, name, &stats);
+        try out.print("{s:<13} output   {d:>4}/{d:<4}\n", .{ dir, stats.passed, stats.passed + stats.failed });
+        total_failed += stats.failed;
+        total += stats.passed + stats.failed;
     }
 
     if (total_failed > 0) {
@@ -199,5 +228,58 @@ fn checkCase(s: *Suite, compiled: js.CompileError!js.CompiledSchema, data: Value
     const res = schema.validate(arena.allocator(), data) catch |err| return @errorName(err);
     if (res.valid != ok) return "validate() disagrees with isValid()";
     if (!res.valid and res.errors.len == 0) return "invalid result without errors";
+
+    inline for (.{ js.OutputFormat.flag, .basic, .detailed, .verbose }) |format| {
+        const output = schema.output(arena.allocator(), data, format) catch |err| return @errorName(err);
+        if (output.object.get("valid").?.bool != ok) return "output(." ++ @tagName(format) ++ ") disagrees with isValid()";
+        if (!try s.output_schema.isValid(output)) return "output(." ++ @tagName(format) ++ ") does not match the output schema";
+    }
+    return null;
+}
+
+fn runOutputFile(s: *Suite, draft_dir: []const u8, name: []const u8, stats: *Stats) !void {
+    const path = try std.fmt.allocPrint(s.arena, "output-tests/{s}/content/{s}", .{ draft_dir, name });
+    const text = try s.root.readFileAlloc(s.io, path, s.arena, .limited(1 << 20));
+    const groups = try std.json.parseFromSliceLeaky(Value, s.arena, text, .{});
+    for (groups.array.items) |group| {
+        var v = js.Validator.init(s.gpa, .{});
+        defer v.deinit();
+        const compiled = v.compile(group.object.get("schema").?);
+        for (group.object.get("tests").?.array.items) |case| {
+            var it = case.object.get("output").?.object.iterator();
+            while (it.next()) |e| {
+                const problem = try checkOutput(s, compiled, case.object.get("data").?, e.key_ptr.*, e.value_ptr.*);
+                if (problem == null) {
+                    stats.passed += 1;
+                    continue;
+                }
+                stats.failed += 1;
+                try s.out.print("FAIL output-tests/{s}/content/{s}: {s}: {s} ({s}): {s}\n", .{
+                    draft_dir,
+                    name,
+                    group.object.get("description").?.string,
+                    case.object.get("description").?.string,
+                    e.key_ptr.*,
+                    problem.?,
+                });
+            }
+        }
+    }
+}
+
+fn checkOutput(s: *Suite, compiled: js.CompileError!js.CompiledSchema, data: Value, format_name: []const u8, expected: Value) !?[]const u8 {
+    const schema = compiled catch |err| return @errorName(err);
+    const format = std.meta.stringToEnum(js.OutputFormat, format_name) orelse return "unknown output format";
+    var arena = std.heap.ArenaAllocator.init(s.gpa);
+    defer arena.deinit();
+    const output = schema.output(arena.allocator(), data, format) catch |err| return @errorName(err);
+    // The expected schema refers to the output schema by URI.
+    const check = s.output_validator.compile(expected) catch |err| return @errorName(err);
+    if (!try check.isValid(output)) {
+        if (suite_options.verbose) {
+            try s.out.print("  output: {f}\n", .{std.json.fmt(output, .{})});
+        }
+        return "output does not match the expected schema";
+    }
     return null;
 }

@@ -1,0 +1,57 @@
+{
+  "$schema": "http://json-schema.org/draft-06/schema#",
+  "type": "object",
+  "properties": {
+    "body": {
+      "$ref": "#/definitions/Expr"
+    }
+  },
+  "required": [
+    "body"
+  ],
+  "definitions": {
+    "Expr": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "num": {
+              "type": "number"
+            }
+          },
+          "required": [
+            "num"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "add": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/Expr"
+              }
+            }
+          },
+          "required": [
+            "add"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "neg": {
+              "$ref": "#/definitions/Expr"
+            }
+          },
+          "required": [
+            "neg"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    }
+  }
+}

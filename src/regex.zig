@@ -21,6 +21,19 @@ const unicode_data = @import("unicode_data.zig");
 
 pub const Error = error{InvalidRegex} || Allocator.Error;
 
+/// Matching gave up: it exceeded its step budget, or the backtracking
+/// stack exceeded `max_backtrack_frames` (see `Regex.isMatchLimited`).
+pub const MatchError = error{RegexLimitExceeded} || Allocator.Error;
+
+/// Default budget of steps per `isMatch` call, about 10 per input
+/// character for ordinary patterns (so inputs of about a million
+/// characters), and tens of milliseconds at worst.
+pub const default_step_limit = 10_000_000;
+
+/// Bound on the backtracking VM's stack (16 bytes per entry), independent of
+/// the step budget.
+pub const max_backtrack_frames = 1 << 20;
+
 const max_repeat_expansion = 1000;
 
 const Set = union(enum) {
@@ -68,6 +81,9 @@ pub const Regex = struct {
     classes: []const Class,
     n_saves: u32,
     n_regs: u32,
+    /// Backreferences and lookarounds need the backtracking VM; every other
+    /// pattern is matched by NFA simulation in linear time.
+    needs_backtracking: bool,
 
     /// Compiles `pattern`. Memory is owned by `allocator` (an arena is
     /// recommended; there is no `deinit`).
@@ -85,11 +101,17 @@ pub const Regex = struct {
         try c.compileNode(ast);
         try c.emit(.{ .save = 1 });
         try c.emit(.match);
+        const insts = try c.insts.toOwnedSlice(allocator);
+        const needs_backtracking = for (insts) |inst| switch (inst) {
+            .look, .backref, .at_end_of_look => break true,
+            else => {},
+        } else false;
         return .{
-            .insts = try c.insts.toOwnedSlice(allocator),
+            .insts = insts,
             .classes = parser.classes.items,
             .n_saves = (parser.group_count + 1) * 2,
             .n_regs = c.n_regs,
+            .needs_backtracking = needs_backtracking,
         };
     }
 
@@ -104,8 +126,20 @@ pub const Regex = struct {
         return true;
     }
 
-    /// Returns true if the regex matches anywhere in `input` (UTF-8).
-    pub fn isMatch(self: *const Regex, allocator: Allocator, input: []const u8) Allocator.Error!bool {
+    /// Returns true if the regex matches anywhere in `input` (UTF-8), within
+    /// `default_step_limit` steps.
+    pub fn isMatch(self: *const Regex, allocator: Allocator, input: []const u8) MatchError!bool {
+        return self.isMatchLimited(allocator, input, default_step_limit);
+    }
+
+    /// Like `isMatch`, but gives up with `error.RegexLimitExceeded` after
+    /// `step_limit` steps (for the whole search, over every start position).
+    ///
+    /// Patterns without backreferences and lookarounds (almost all JSON
+    /// Schema patterns) run in O(input × pattern) time and O(pattern)
+    /// memory, so catastrophic backtracking (`^(a+)+$`) cannot happen to
+    /// them. The others use a backtracking VM, which the budget bounds.
+    pub fn isMatchLimited(self: *const Regex, allocator: Allocator, input: []const u8, step_limit: usize) MatchError!bool {
         const cps = decodeUtf8(allocator, input) catch blk: {
             // Not valid UTF-8: fall back to treating each byte as a code point.
             const buf = try allocator.alloc(u21, input.len);
@@ -113,7 +147,11 @@ pub const Regex = struct {
             break :blk buf;
         };
         defer allocator.free(cps);
+        if (!self.needs_backtracking) return self.simulate(allocator, cps, step_limit);
+        return self.backtrack(allocator, cps, step_limit);
+    }
 
+    fn backtrack(self: *const Regex, allocator: Allocator, cps: []const u21, step_limit: usize) MatchError!bool {
         const saves = try allocator.alloc(usize, self.n_saves);
         defer allocator.free(saves);
         const regs = try allocator.alloc(usize, self.n_regs);
@@ -125,15 +163,115 @@ pub const Regex = struct {
             .saves = saves,
             .regs = regs,
             .allocator = allocator,
+            .step_limit = step_limit,
         };
+        defer vm.stack.deinit(allocator);
+        @memset(saves, std.math.maxInt(usize));
+        @memset(regs, std.math.maxInt(usize));
         var start: usize = 0;
         while (start <= cps.len) : (start += 1) {
-            @memset(saves, std.math.maxInt(usize));
-            @memset(regs, std.math.maxInt(usize));
-            vm.steps = 0;
+            // A failed run leaves the registers as it found them (unset).
             if (try vm.run(0, start, null)) return true;
         }
         return false;
+    }
+
+    /// Thompson NFA simulation: all threads advance in lock step over the
+    /// input, each program counter at most once per position, so the time is
+    /// O(input × program) and the memory O(program), whatever the pattern.
+    /// Only whether a match exists is computed (captures, priorities and
+    /// the empty-loop checks do not change that for these patterns).
+    fn simulate(self: *const Regex, allocator: Allocator, input: []const u21, step_limit: usize) MatchError!bool {
+        const n = self.insts.len;
+        var current = try allocator.alloc(u32, n);
+        defer allocator.free(current);
+        var next = try allocator.alloc(u32, n);
+        defer allocator.free(next);
+        // `seen[pc] == sp + 1` once pc was added at position sp.
+        const seen = try allocator.alloc(usize, n);
+        defer allocator.free(seen);
+        @memset(seen, 0);
+        const pending = try allocator.alloc(u32, n);
+        defer allocator.free(pending);
+
+        var sim: Simulation = .{ .re = self, .input = input, .seen = seen, .pending = pending, .step_limit = step_limit };
+        var current_len: usize = 0;
+        var sp: usize = 0;
+        while (true) : (sp += 1) {
+            // Unanchored search: a match may start at every position.
+            if (try sim.add(current, &current_len, 0, sp)) return true;
+            if (sp == input.len) return false;
+            var next_len: usize = 0;
+            for (current[0..current_len]) |pc| {
+                const c = input[sp];
+                const consumes = switch (self.insts[pc]) {
+                    .char => |ch| ch == c,
+                    .any => !isLineTerminator(c),
+                    .class => |i| classContains(self.classes[i], c),
+                    else => unreachable,
+                };
+                if (consumes and try sim.add(next, &next_len, pc + 1, sp + 1)) return true;
+            }
+            std.mem.swap([]u32, &current, &next);
+            current_len = next_len;
+        }
+    }
+};
+
+const Simulation = struct {
+    re: *const Regex,
+    input: []const u21,
+    seen: []usize,
+    pending: []u32,
+    steps: usize = 0,
+    step_limit: usize,
+
+    /// Adds `pc` and everything reachable from it without consuming input
+    /// (at position `sp`) to `list`. Returns true on reaching `.match`.
+    fn add(sim: *Simulation, list: []u32, len: *usize, pc: u32, sp: usize) MatchError!bool {
+        var top: usize = 0;
+        if (sim.visit(pc, sp)) {
+            sim.pending[top] = pc;
+            top += 1;
+        }
+        while (top > 0) {
+            top -= 1;
+            const at = sim.pending[top];
+            sim.steps += 1;
+            if (sim.steps > sim.step_limit) return error.RegexLimitExceeded;
+            const follow: [2]?u32 = switch (sim.re.insts[at]) {
+                .match => return true,
+                .char, .any, .class => {
+                    list[len.*] = at;
+                    len.* += 1;
+                    continue;
+                },
+                .jmp => |t| .{ t, null },
+                // Push `y` first so `x` is explored first (order only
+                // matters for efficiency here).
+                .split => |s| .{ s.y, s.x },
+                .save, .mark, .progress => .{ at + 1, null },
+                .line_start => if (sp == 0) .{ at + 1, null } else continue,
+                .line_end => if (sp == sim.input.len) .{ at + 1, null } else continue,
+                .word_boundary => |want| blk: {
+                    const a = sp > 0 and isWord(sim.input[sp - 1]);
+                    const b = sp < sim.input.len and isWord(sim.input[sp]);
+                    break :blk if ((a != b) == want) .{ at + 1, null } else continue;
+                },
+                .look, .backref, .at_end_of_look => unreachable, // needs_backtracking
+            };
+            for (follow) |maybe| if (maybe) |t| if (sim.visit(t, sp)) {
+                sim.pending[top] = t;
+                top += 1;
+            };
+        }
+        return false;
+    }
+
+    fn visit(sim: *Simulation, pc: u32, sp: usize) bool {
+        if (sim.seen[pc] == sp + 1) return false;
+        sim.seen[pc] = sp + 1;
+        return true;
     }
 };
 
@@ -889,7 +1027,15 @@ const Compiler = struct {
 // VM
 // ---------------------------------------------------------------------------
 
-const max_steps = 10_000_000;
+/// An entry of the backtracking stack: a branch to resume, or an undo
+/// record for a capture / loop register written since the last branch.
+const Frame = struct {
+    kind: enum(u8) { branch, save, reg },
+    /// Branch: program counter. Undo: the register index.
+    index: u32,
+    /// Branch: input position. Undo: the previous register value.
+    value: usize,
+};
 
 const Vm = struct {
     re: *const Regex,
@@ -897,77 +1043,99 @@ const Vm = struct {
     saves: []usize,
     regs: []usize,
     allocator: Allocator,
+    stack: std.ArrayList(Frame) = .empty,
     steps: usize = 0,
+    step_limit: usize,
 
-    /// Runs from `pc` at `sp`. `look_target` is the required end position
-    /// when running a lookbehind body.
-    fn run(vm: *Vm, start_pc: u32, start_sp: usize, look_target: ?usize) Allocator.Error!bool {
+    /// Runs from `pc` at `sp` until `.match` (true) or until every branch
+    /// failed (false, with every register restored). `look_target` is the
+    /// required end position when running a lookbehind body.
+    ///
+    /// Backtracking uses `stack` rather than recursion, so the native stack
+    /// depth is bounded by the pattern's lookaround nesting, not the input.
+    fn run(vm: *Vm, start_pc: u32, start_sp: usize, look_target: ?usize) MatchError!bool {
+        const base = vm.stack.items.len;
         var pc = start_pc;
         var sp = start_sp;
         while (true) {
             vm.steps += 1;
-            if (vm.steps > max_steps) return false;
-            switch (vm.re.insts[pc]) {
-                .match => return true,
-                .char => |ch| {
-                    if (sp >= vm.input.len or vm.input[sp] != ch) return false;
+            if (vm.steps > vm.step_limit) return error.RegexLimitExceeded;
+            const ok = switch (vm.re.insts[pc]) {
+                .match => {
+                    // A sub-run (lookaround) is atomic: its branches are
+                    // dropped, but its undo records stay so that an outer
+                    // backtrack still restores what it captured.
+                    vm.dropBranches(base);
+                    return true;
+                },
+                .char => |ch| blk: {
+                    if (sp >= vm.input.len or vm.input[sp] != ch) break :blk false;
                     sp += 1;
                     pc += 1;
+                    break :blk true;
                 },
-                .any => {
-                    if (sp >= vm.input.len or isLineTerminator(vm.input[sp])) return false;
+                .any => blk: {
+                    if (sp >= vm.input.len or isLineTerminator(vm.input[sp])) break :blk false;
                     sp += 1;
                     pc += 1;
+                    break :blk true;
                 },
-                .class => |i| {
-                    if (sp >= vm.input.len or !classContains(vm.re.classes[i], vm.input[sp])) return false;
+                .class => |i| blk: {
+                    if (sp >= vm.input.len or !classContains(vm.re.classes[i], vm.input[sp])) break :blk false;
                     sp += 1;
                     pc += 1;
+                    break :blk true;
                 },
-                .jmp => |t| pc = t,
-                .split => |s| {
-                    const saved_saves = try vm.allocator.dupe(usize, vm.saves);
-                    defer vm.allocator.free(saved_saves);
-                    const saved_regs = try vm.allocator.dupe(usize, vm.regs);
-                    defer vm.allocator.free(saved_regs);
-                    if (try vm.run(s.x, sp, look_target)) return true;
-                    @memcpy(vm.saves, saved_saves);
-                    @memcpy(vm.regs, saved_regs);
-                    pc = s.y;
+                .jmp => |t| blk: {
+                    pc = t;
+                    break :blk true;
                 },
-                .save => |n| {
+                .split => |s| blk: {
+                    try vm.push(.{ .kind = .branch, .index = s.y, .value = sp });
+                    pc = s.x;
+                    break :blk true;
+                },
+                .save => |n| blk: {
+                    try vm.push(.{ .kind = .save, .index = n, .value = vm.saves[n] });
                     vm.saves[n] = sp;
                     pc += 1;
+                    break :blk true;
                 },
-                .mark => |r| {
+                .mark => |r| blk: {
+                    try vm.push(.{ .kind = .reg, .index = r, .value = vm.regs[r] });
                     vm.regs[r] = sp;
                     pc += 1;
+                    break :blk true;
                 },
-                .progress => |r| {
-                    if (vm.regs[r] == sp) return false;
+                .progress => |r| blk: {
+                    if (vm.regs[r] == sp) break :blk false;
                     pc += 1;
+                    break :blk true;
                 },
-                .line_start => {
-                    if (sp != 0) return false;
+                .line_start => blk: {
+                    if (sp != 0) break :blk false;
                     pc += 1;
+                    break :blk true;
                 },
-                .line_end => {
-                    if (sp != vm.input.len) return false;
+                .line_end => blk: {
+                    if (sp != vm.input.len) break :blk false;
                     pc += 1;
+                    break :blk true;
                 },
-                .word_boundary => |want| {
+                .word_boundary => |want| blk: {
                     const a = sp > 0 and isWord(vm.input[sp - 1]);
                     const b = sp < vm.input.len and isWord(vm.input[sp]);
-                    if ((a != b) != want) return false;
+                    if ((a != b) != want) break :blk false;
                     pc += 1;
+                    break :blk true;
                 },
-                .at_end_of_look => {
-                    if (look_target == null or sp != look_target.?) return false;
+                .at_end_of_look => blk: {
+                    if (look_target == null or sp != look_target.?) break :blk false;
                     pc += 1;
+                    break :blk true;
                 },
-                .look => |l| {
-                    const saved_saves = try vm.allocator.dupe(usize, vm.saves);
-                    defer vm.allocator.free(saved_saves);
+                .look => |l| blk: {
+                    // A failed sub-run restores every register itself.
                     var matched = false;
                     if (l.behind) {
                         var k: usize = sp + 1;
@@ -977,29 +1145,61 @@ const Vm = struct {
                                 matched = true;
                                 break;
                             }
-                            @memcpy(vm.saves, saved_saves);
                         }
                     } else {
                         matched = try vm.run(l.start, sp, null);
                     }
-                    if (matched == l.negated) return false;
-                    // Negative lookarounds never leave captures behind.
-                    if (l.negated) @memcpy(vm.saves, saved_saves);
+                    // A matched negative lookaround fails here, and the
+                    // backtrack below undoes what its body captured.
+                    if (matched == l.negated) break :blk false;
                     pc = l.end;
+                    break :blk true;
                 },
-                .backref => |n| {
+                .backref => |n| blk: {
                     const s = vm.saves[n * 2];
                     const e = vm.saves[n * 2 + 1];
                     if (s != std.math.maxInt(usize) and e != std.math.maxInt(usize) and e >= s) {
                         const len = e - s;
-                        if (sp + len > vm.input.len) return false;
-                        if (!std.mem.eql(u21, vm.input[s..e], vm.input[sp .. sp + len])) return false;
+                        if (sp + len > vm.input.len) break :blk false;
+                        if (!std.mem.eql(u21, vm.input[s..e], vm.input[sp .. sp + len])) break :blk false;
                         sp += len;
                     }
                     pc += 1;
+                    break :blk true;
                 },
+            };
+            if (ok) continue;
+
+            // Backtrack: undo writes until the most recent branch of this run.
+            while (true) {
+                if (vm.stack.items.len == base) return false;
+                const f = vm.stack.pop().?;
+                switch (f.kind) {
+                    .save => vm.saves[f.index] = f.value,
+                    .reg => vm.regs[f.index] = f.value,
+                    .branch => {
+                        pc = f.index;
+                        sp = f.value;
+                        break;
+                    },
+                }
             }
         }
+    }
+
+    fn push(vm: *Vm, frame: Frame) MatchError!void {
+        if (vm.stack.items.len >= max_backtrack_frames) return error.RegexLimitExceeded;
+        try vm.stack.append(vm.allocator, frame);
+    }
+
+    fn dropBranches(vm: *Vm, base: usize) void {
+        var kept = base;
+        for (vm.stack.items[base..]) |f| {
+            if (f.kind == .branch) continue;
+            vm.stack.items[kept] = f;
+            kept += 1;
+        }
+        vm.stack.shrinkRetainingCapacity(kept);
     }
 };
 
@@ -1030,4 +1230,65 @@ test "regex basics" {
     try std.testing.expect(!try testMatch("^🐲*$", "🐉"));
     try std.testing.expectError(error.InvalidRegex, testMatch("\\a", ""));
     try std.testing.expectError(error.InvalidRegex, testMatch("^(abc]", ""));
+}
+
+test "the NFA simulation and the backtracking VM agree" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const patterns = [_][]const u8{
+        "^a*$",                         "a|b",                       "^(ab|cd)+$", "^(?:a*)*$", "^(a|ab)(c|bcd)(d*)$",
+        "^[0-9]{2,4}$",                 "x{0,3}y",                   "^.$",        "\\bfoo\\b", "^\\p{L}+\\d*$",
+        "(a+)+b",                       "^(a?){3}a{3}$",             "^$",         "[^a-c]+",   "^(?:(a)|b)*?c$",
+        "^\\s*[a-z]+(?:-[a-z]+)*\\s*$",
+        "é+",
+        "\\B.\\B",                      "^[\\u{1F600}-\\u{1F64F}]$",
+    };
+    const inputs = [_][]const u8{
+        "",      "a",      "aaa",  "aab",   "ab",     "abcd", "abcdab", "abcd d", "12",               "12345", "xxxxy", "\n",
+        " foo ", "foobar", "ab12", "aaaab", "aaaaaa", "ddd",  "aac",    "bbc",    "  kebab-case-x  ",
+        "ééé",
+        "abc",
+        "😀",
+    };
+    for (patterns) |pattern| {
+        const re = try Regex.compile(a, pattern);
+        try std.testing.expect(!re.needs_backtracking);
+        for (inputs) |input| {
+            const cps = try decodeUtf8(a, input);
+            const nfa = try re.simulate(a, cps, default_step_limit);
+            const bt = try re.backtrack(a, cps, default_step_limit);
+            if (nfa != bt) {
+                std.debug.print("/{s}/ on \"{s}\": NFA {}, backtracking {}\n", .{ pattern, input, nfa, bt });
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
+}
+
+test "catastrophic patterns are linear, or stopped by the step limit" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Exponential for a backtracking engine; linear for the NFA simulation.
+    const evil = try a.alloc(u8, 10_000);
+    @memset(evil, 'a');
+    evil[evil.len - 1] = 'b';
+    for ([_][]const u8{ "^(a+)+$", "^(a|a)*$", "^(a|aa)+$", "^(.*a){12}$" }) |pattern| {
+        const re = try Regex.compile(a, pattern);
+        try std.testing.expect(!try re.isMatch(a, evil));
+    }
+
+    // A long input is fine (and does not grow the native stack).
+    const long = try a.alloc(u8, 500_000);
+    @memset(long, 'x');
+    try std.testing.expect(try (try Regex.compile(a, "^(?:x|y)*$")).isMatch(a, long));
+
+    // A backreference forces backtracking: the budget stops it.
+    const re = try Regex.compile(a, "^(a+)+\\1$");
+    try std.testing.expect(re.needs_backtracking);
+    try std.testing.expectError(error.RegexLimitExceeded, re.isMatch(a, evil[evil.len - 40 ..]));
+    // Tight budgets apply to the NFA simulation too.
+    try std.testing.expectError(error.RegexLimitExceeded, (try Regex.compile(a, "^x*$")).isMatchLimited(a, long, 1000));
 }

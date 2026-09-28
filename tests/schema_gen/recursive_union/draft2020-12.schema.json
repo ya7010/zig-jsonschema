@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "body": {
+      "$ref": "#/$defs/Expr"
+    }
+  },
+  "required": [
+    "body"
+  ],
+  "$defs": {
+    "Expr": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "num": {
+              "type": "number"
+            }
+          },
+          "required": [
+            "num"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "add": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Expr"
+              }
+            }
+          },
+          "required": [
+            "add"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "neg": {
+              "$ref": "#/$defs/Expr"
+            }
+          },
+          "required": [
+            "neg"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    }
+  }
+}

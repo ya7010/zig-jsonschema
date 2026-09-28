@@ -71,6 +71,11 @@ pub const Options = struct {
     /// Maximum nesting of schema evaluation before giving up (guards against
     /// infinitely recursive `$ref`s).
     max_depth: usize = 1000,
+    /// Budget of regex steps for each `pattern` / `patternProperties` match
+    /// (see `Regex.isMatchLimited`). Exceeding it fails validation with
+    /// `error.RegexLimitExceeded` rather than guessing an answer, so a
+    /// hostile pattern or input cannot stall the validator.
+    regex_step_limit: usize = @import("regex.zig").default_step_limit,
 };
 
 pub const CompileError = error{
@@ -86,15 +91,38 @@ pub const ValidateError = error{
     InvalidSchema,
     UnknownMetaschema,
     UnsupportedVocabulary,
+    /// A regex match exceeded `Options.regex_step_limit` (or the regex
+    /// engine's memory bound).
+    RegexLimitExceeded,
 } || Allocator.Error;
 
 /// A single validation failure.
 pub const Error = struct {
     /// JSON Pointer to the offending part of the instance.
     instance_location: []const u8,
-    /// JSON Pointer (within the schema document) to the failing keyword.
+    /// JSON Pointer to the failing keyword along the evaluation path from
+    /// the root schema, through `$ref`s (e.g. `/properties/a/$ref/type`).
     keyword_location: []const u8,
+    /// Absolute URI of the failing keyword: its schema resource plus a JSON
+    /// Pointer fragment (e.g. `https://example.com/s.json#/$defs/a/type`).
+    absolute_keyword_location: []const u8,
     message: []const u8,
+};
+
+/// Standard output formats of JSON Schema 2019-09 / 2020-12 (section 12 of
+/// the 2020-12 core specification), produced by `Schema.output`.
+pub const OutputFormat = enum {
+    /// `{"valid": bool}`
+    flag,
+    /// The root unit, with every error (when invalid) or every annotation
+    /// (when valid) in a flat list.
+    basic,
+    /// A tree following the schema structure, with only the units that
+    /// explain the result (failures or annotations), single-child chains
+    /// collapsed.
+    detailed,
+    /// The full tree of every evaluated subschema.
+    verbose,
 };
 
 pub const Result = struct {
@@ -174,15 +202,24 @@ const TypeSet = packed struct(u8) {
     _pad: u1 = 0,
 };
 
+/// A JSON number. Integers (including those beyond i64, such as u64
+/// bounds) are kept exact; anything else is an f64.
 const Num = union(enum) {
-    int: i64,
+    int: i256,
     float: f64,
 
     fn toF64(n: Num) f64 {
         return switch (n) {
-            .int => |i| @floatFromInt(i),
+            .int => |i| intToF64(i),
             .float => |f| f,
         };
+    }
+
+    pub fn format(n: Num, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        switch (n) {
+            .int => |i| try w.print("{d}", .{i}),
+            .float => |f| try w.print("{d}", .{f}),
+        }
     }
 };
 
@@ -218,7 +255,14 @@ const Keyword = union(enum) {
     content: struct { encoding: ?[]const u8, media_type: ?[]const u8 },
     /// `prefix` = `prefixItems` (or array-form `items`), `rest` = `items`
     /// (or `additionalItems`) applied to every index past `prefix`.
-    items: struct { prefix: []const *Node, rest: ?*Node },
+    items: struct {
+        prefix: []const *Node,
+        rest: ?*Node,
+        /// Keyword names, for output: `prefixItems` / `items` (2020-12),
+        /// or `items` / `additionalItems`.
+        prefix_keyword: []const u8,
+        rest_keyword: []const u8,
+    },
     contains: struct { node: *Node, min: u64, max: ?u64 },
     max_items: u64,
     min_items: u64,
@@ -228,7 +272,8 @@ const Keyword = union(enum) {
     additional_properties: struct { node: *Node, names: []const []const u8, patterns: []const Regex },
     property_names: *Node,
     required: []const []const u8,
-    dependent_required: []const NamedList,
+    /// `dependentRequired`, or the array form of `dependencies`.
+    dependent_required: struct { keyword: []const u8, deps: []const NamedList },
     dependent_schemas: []const NamedNode,
     max_properties: u64,
     min_properties: u64,
@@ -250,7 +295,36 @@ const Node = struct {
     /// Whether some keyword here needs sibling annotations
     /// (`unevaluated*`).
     uses_unevaluated: bool = false,
+    /// Keywords whose value is an annotation (`title`, `readOnly`, unknown
+    /// keywords, ...), reported by `Schema.output`.
+    annotations: []const AnnotationKeyword = &.{},
 };
+
+const AnnotationKeyword = struct { keyword: []const u8, value: *const Value };
+
+/// Keywords that only annotate: their value is the annotation.
+const annotation_keywords = std.StaticStringMap(void).initComptime(.{
+    .{"title"},           .{"description"},      .{"default"},       .{"examples"},
+    .{"deprecated"},      .{"readOnly"},         .{"writeOnly"},     .{"format"},
+    .{"contentEncoding"}, .{"contentMediaType"}, .{"contentSchema"},
+});
+
+/// Every keyword of drafts 4 to 2020-12 that is not an annotation keyword;
+/// any other key of a 2019-09+ schema is an unknown keyword, collected as an
+/// annotation.
+const known_keywords = std.StaticStringMap(void).initComptime(.{
+    .{"$schema"},          .{"$id"},                   .{"id"},                .{"$ref"},                 .{"$anchor"},
+    .{"$dynamicAnchor"},   .{"$dynamicRef"},           .{"$recursiveRef"},     .{"$recursiveAnchor"},     .{"$vocabulary"},
+    .{"$comment"},         .{"$defs"},                 .{"definitions"},       .{"type"},                 .{"enum"},
+    .{"const"},            .{"multipleOf"},            .{"maximum"},           .{"exclusiveMaximum"},     .{"minimum"},
+    .{"exclusiveMinimum"}, .{"maxLength"},             .{"minLength"},         .{"pattern"},              .{"maxItems"},
+    .{"minItems"},         .{"uniqueItems"},           .{"maxContains"},       .{"minContains"},          .{"maxProperties"},
+    .{"minProperties"},    .{"required"},              .{"dependentRequired"}, .{"allOf"},                .{"anyOf"},
+    .{"oneOf"},            .{"not"},                   .{"if"},                .{"then"},                 .{"else"},
+    .{"dependentSchemas"}, .{"dependencies"},          .{"prefixItems"},       .{"items"},                .{"additionalItems"},
+    .{"contains"},         .{"properties"},            .{"patternProperties"}, .{"additionalProperties"}, .{"propertyNames"},
+    .{"unevaluatedItems"}, .{"unevaluatedProperties"},
+});
 
 /// Holds compiled schemas and every resource (remote documents, embedded
 /// `$id`s, built-in metaschemas) they may reference.
@@ -545,6 +619,19 @@ pub const Validator = struct {
             return node;
         }
 
+        var annots: std.ArrayList(AnnotationKeyword) = .empty;
+        {
+            var it = obj.iterator();
+            while (it.next()) |e| {
+                const k = e.key_ptr.*;
+                const unknown = !known_keywords.has(k) and !annotation_keywords.has(k);
+                if (annotation_keywords.has(k) or (unknown and scope.draft.atLeast(.draft2019_09))) {
+                    try annots.append(a, .{ .keyword = k, .value = e.value_ptr });
+                }
+            }
+        }
+        node.annotations = annots.items;
+
         if (d == .draft2020_12 and v.core) {
             if (obj.get("$dynamicRef")) |rv| {
                 if (rv != .string) return error.InvalidSchema;
@@ -614,7 +701,7 @@ pub const Validator = struct {
                     var list: std.ArrayList(NamedList) = .empty;
                     var it = x.object.iterator();
                     while (it.next()) |e| try list.append(a, .{ .name = e.key_ptr.*, .list = try parseStringList(a, e.value_ptr.*) });
-                    try kws.append(a, .{ .dependent_required = list.items });
+                    try kws.append(a, .{ .dependent_required = .{ .keyword = "dependentRequired", .deps = list.items } });
                 }
             }
         }
@@ -643,6 +730,8 @@ pub const Validator = struct {
             var prefix: []const *Node = &.{};
             var rest: ?*Node = null;
             var has_items = false;
+            var prefix_keyword: []const u8 = "prefixItems";
+            var rest_keyword: []const u8 = "items";
             if (d == .draft2020_12) {
                 if (obj.getPtr("prefixItems")) |pv| {
                     prefix = try self.compileSchemaArray(pv, scope, "prefixItems");
@@ -655,6 +744,8 @@ pub const Validator = struct {
             } else if (obj.getPtr("items")) |iv| {
                 has_items = true;
                 if (iv.* == .array) {
+                    prefix_keyword = "items";
+                    rest_keyword = "additionalItems";
                     prefix = try self.compileSchemaArray(iv, scope, "items");
                     if (obj.getPtr("additionalItems")) |av| {
                         rest = try self.compileSchema(av, try self.childScope(scope, &.{"additionalItems"}), false);
@@ -669,7 +760,12 @@ pub const Validator = struct {
                     _ = try self.compileSchema(av, try self.childScope(scope, &.{"additionalItems"}), false);
                 }
             }
-            if (has_items) try kws.append(a, .{ .items = .{ .prefix = prefix, .rest = rest } });
+            if (has_items) try kws.append(a, .{ .items = .{
+                .prefix = prefix,
+                .rest = rest,
+                .prefix_keyword = prefix_keyword,
+                .rest_keyword = rest_keyword,
+            } });
 
             if (d.atLeast(.draft6)) {
                 if (obj.getPtr("contains")) |cv| {
@@ -762,7 +858,7 @@ pub const Validator = struct {
                         });
                     }
                 }
-                if (reqs.items.len > 0) try kws.append(a, .{ .dependent_required = reqs.items });
+                if (reqs.items.len > 0) try kws.append(a, .{ .dependent_required = .{ .keyword = "dependencies", .deps = reqs.items } });
                 if (schemas.items.len > 0) try kws.append(a, .{ .dependent_schemas = schemas.items });
             }
 
@@ -902,7 +998,97 @@ pub const Schema = struct {
         const ok = try ctx.eval(self.root, &instance, null);
         return .{ .valid = ok, .errors = ctx.errors.items };
     }
+
+    /// Validates `instance` and describes the result in one of the standard
+    /// output formats, as a JSON value (every output unit has `valid`,
+    /// `keywordLocation`, `absoluteKeywordLocation` and `instanceLocation`,
+    /// plus `error` or `annotation`). All returned memory is owned by
+    /// `allocator` (an arena is recommended).
+    pub fn output(self: Schema, allocator: Allocator, instance: Value, format: OutputFormat) ValidateError!Value {
+        if (format == .flag) {
+            var obj: std.json.ObjectMap = .empty;
+            try obj.put(allocator, "valid", .{ .bool = try self.isValid(instance) });
+            return .{ .object = obj };
+        }
+        var ctx: Ctx = .{ .allocator = allocator, .validator = self.validator, .collect = true, .output = true };
+        var holder: Unit = .{ .keyword_location = "", .absolute_keyword_location = "", .instance_location = "" };
+        ctx.unit = &holder;
+        _ = try ctx.eval(self.root, &instance, null);
+        const root = holder.children.items[0];
+        return switch (format) {
+            .flag => unreachable,
+            .basic => basicOutput(allocator, root),
+            .detailed => (try detailedOutput(allocator, root, true)).?,
+            .verbose => verboseOutput(allocator, root),
+        };
+    }
 };
+
+fn unitJson(allocator: Allocator, u: *const Unit, children: ?[]const Value) Allocator.Error!Value {
+    var obj: std.json.ObjectMap = .empty;
+    try obj.put(allocator, "valid", .{ .bool = u.valid });
+    try obj.put(allocator, "keywordLocation", .{ .string = u.keyword_location });
+    try obj.put(allocator, "absoluteKeywordLocation", .{ .string = u.absolute_keyword_location });
+    try obj.put(allocator, "instanceLocation", .{ .string = u.instance_location });
+    if (u.@"error") |e| try obj.put(allocator, "error", .{ .string = e });
+    if (u.annotation) |an| try obj.put(allocator, "annotation", an);
+    if (children) |list| if (list.len > 0) {
+        var arr: std.json.Array = .init(allocator);
+        try arr.appendSlice(list);
+        try obj.put(allocator, if (u.valid) "annotations" else "errors", .{ .array = arr });
+    };
+    return .{ .object = obj };
+}
+
+/// The root unit with a flat list: every error of a failed evaluation, or
+/// every annotation of a successful one.
+fn basicOutput(allocator: Allocator, root: *const Unit) Allocator.Error!Value {
+    var list: std.ArrayList(Value) = .empty;
+    if (root.valid) try collectAnnotations(allocator, root, &list) else try collectErrors(allocator, root, &list);
+    return unitJson(allocator, root, list.items);
+}
+
+fn collectErrors(allocator: Allocator, u: *const Unit, list: *std.ArrayList(Value)) Allocator.Error!void {
+    if (u.@"error" != null) try list.append(allocator, try unitJson(allocator, u, null));
+    // Only failures that caused this one: not those of valid subschemas
+    // (e.g. a failed `anyOf` branch next to a passing one) or of `if`.
+    for (u.children.items) |c| if (!c.valid and !c.probe_only) try collectErrors(allocator, c, list);
+}
+
+fn collectAnnotations(allocator: Allocator, u: *const Unit, list: *std.ArrayList(Value)) Allocator.Error!void {
+    for (u.children.items) |c| {
+        if (c.annotation != null) {
+            try list.append(allocator, try unitJson(allocator, c, null));
+        } else if (c.valid) {
+            // Failed subschemas keep no annotations.
+            try collectAnnotations(allocator, c, list);
+        }
+    }
+}
+
+/// The unit tree reduced to what explains the result, or null if `u`
+/// contributes nothing.
+fn detailedOutput(allocator: Allocator, u: *const Unit, is_root: bool) Allocator.Error!?Value {
+    if (u.annotation != null) return try unitJson(allocator, u, null);
+    var kept: std.ArrayList(Value) = .empty;
+    for (u.children.items) |c| {
+        const relevant = if (u.valid) c.valid else !c.valid and !c.probe_only;
+        if (!relevant) continue;
+        if (try detailedOutput(allocator, c, false)) |v| try kept.append(allocator, v);
+    }
+    if (!is_root) {
+        if (u.@"error" == null and kept.items.len == 0) return null;
+        // A unit that only wraps one other is collapsed into it.
+        if (u.@"error" == null and kept.items.len == 1) return kept.items[0];
+    }
+    return try unitJson(allocator, u, kept.items);
+}
+
+fn verboseOutput(allocator: Allocator, u: *const Unit) Allocator.Error!Value {
+    var children: std.ArrayList(Value) = .empty;
+    for (u.children.items) |c| try children.append(allocator, try verboseOutput(allocator, c));
+    return unitJson(allocator, u, children.items);
+}
 
 // ---------------------------------------------------------------------------
 // Evaluation
@@ -936,6 +1122,21 @@ const Annotations = struct {
     }
 };
 
+/// One node of the output tree built by `Schema.output`: the evaluation of
+/// a subschema (errors and annotations below it), a failed keyword
+/// (`error`) or an annotation.
+const Unit = struct {
+    valid: bool = true,
+    keyword_location: []const u8,
+    absolute_keyword_location: []const u8,
+    instance_location: []const u8,
+    @"error": ?[]const u8 = null,
+    annotation: ?Value = null,
+    children: std.ArrayList(*Unit) = .empty,
+    /// A subschema whose failure is not an error of its parent (`if`).
+    probe_only: bool = false,
+};
+
 const Ctx = struct {
     allocator: Allocator,
     validator: *Validator,
@@ -944,6 +1145,74 @@ const Ctx = struct {
     scope: std.ArrayList(*Resource) = .empty,
     path: std.ArrayList(PathSeg) = .empty,
     depth: usize = 0,
+    /// Build the `Unit` tree (`Schema.output`): no short-circuiting, and
+    /// every applicable subschema is evaluated.
+    output: bool = false,
+    /// The unit of the subschema being evaluated (output mode).
+    unit: ?*Unit = null,
+    /// Evaluation path of the subschema being evaluated (when collecting).
+    kw_loc: []const u8 = "",
+    /// The subschema whose keywords are being evaluated.
+    cur_node: ?*const Node = null,
+    /// Set by a reference keyword just before evaluating its target.
+    via_ref: ?[]const u8 = null,
+
+    fn tracking(ctx: *const Ctx) bool {
+        return ctx.collect or ctx.output;
+    }
+
+    /// Evaluation path of `node`, entered from the current subschema.
+    fn childKwLoc(ctx: *Ctx, node: *const Node) Allocator.Error![]const u8 {
+        if (ctx.via_ref) |r| return std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ ctx.kw_loc, r });
+        const parent = ctx.cur_node orelse return "";
+        // Every other applicator reaches a syntactic subschema, whose
+        // location extends the parent's.
+        if (std.mem.startsWith(u8, node.location, parent.location)) {
+            return std.fmt.allocPrint(ctx.allocator, "{s}{s}", .{ ctx.kw_loc, node.location[parent.location.len..] });
+        }
+        return node.location;
+    }
+
+    /// Absolute URI of `node` (or of its `keyword`).
+    fn absoluteLocation(ctx: *Ctx, node: *const Node, keyword: []const u8) Allocator.Error![]const u8 {
+        const res = node.resource;
+        var rel = node.location;
+        if (res.root) |root| {
+            if (std.mem.startsWith(u8, rel, root.location)) rel = rel[root.location.len..];
+        }
+        if (keyword.len == 0) return std.fmt.allocPrint(ctx.allocator, "{s}#{s}", .{ res.uri, rel });
+        return std.fmt.allocPrint(ctx.allocator, "{s}#{s}/{s}", .{ res.uri, rel, keyword });
+    }
+
+    fn keywordLocation(ctx: *Ctx, keyword: []const u8) Allocator.Error![]const u8 {
+        if (keyword.len == 0) return ctx.kw_loc;
+        return std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ ctx.kw_loc, keyword });
+    }
+
+    /// Adds an annotation unit for `keyword` of `node` (output mode).
+    fn annotate(ctx: *Ctx, node: *const Node, keyword: []const u8, value: Value) Allocator.Error!void {
+        const parent = ctx.unit orelse return;
+        const u = try ctx.allocator.create(Unit);
+        u.* = .{
+            .keyword_location = try ctx.keywordLocation(keyword),
+            .absolute_keyword_location = try ctx.absoluteLocation(node, keyword),
+            .instance_location = try ctx.instanceLocation(),
+            .annotation = value,
+        };
+        try parent.children.append(ctx.allocator, u);
+    }
+
+    /// Marks the unit of the subschema evaluated last as `probe_only`.
+    fn markLastProbeOnly(ctx: *Ctx) void {
+        const parent = ctx.unit orelse return;
+        if (parent.children.items.len > 0) parent.children.items[parent.children.items.len - 1].probe_only = true;
+    }
+
+    fn namesValue(ctx: *Ctx, names: []const []const u8) Allocator.Error!Value {
+        var arr: std.json.Array = .init(ctx.allocator);
+        for (names) |n| try arr.append(.{ .string = n });
+        return .{ .array = arr };
+    }
 
     const PathSeg = union(enum) { key: []const u8, index: usize };
 
@@ -960,22 +1229,41 @@ const Ctx = struct {
     }
 
     fn fail(ctx: *Ctx, node: *const Node, keyword: []const u8, comptime fmt: []const u8, args: anytype) Allocator.Error!void {
+        if (ctx.output) {
+            const parent = ctx.unit orelse return;
+            const message = try std.fmt.allocPrint(ctx.allocator, fmt, args);
+            if (keyword.len == 0) {
+                // The subschema itself (the `false` schema) failed.
+                parent.@"error" = message;
+                return;
+            }
+            const u = try ctx.allocator.create(Unit);
+            u.* = .{
+                .valid = false,
+                .keyword_location = try ctx.keywordLocation(keyword),
+                .absolute_keyword_location = try ctx.absoluteLocation(node, keyword),
+                .instance_location = try ctx.instanceLocation(),
+                .@"error" = message,
+            };
+            try parent.children.append(ctx.allocator, u);
+            return;
+        }
         if (!ctx.collect) return;
         try ctx.errors.append(ctx.allocator, .{
             .instance_location = try ctx.instanceLocation(),
-            .keyword_location = if (keyword.len == 0)
-                node.location
-            else
-                try std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ node.location, keyword }),
+            .keyword_location = try ctx.keywordLocation(keyword),
+            .absolute_keyword_location = try ctx.absoluteLocation(node, keyword),
             .message = try std.fmt.allocPrint(ctx.allocator, fmt, args),
         });
     }
 
     /// Evaluates `node` against `inst` without recording errors (used for
     /// subschemas whose failure is not itself an error, e.g. in `anyOf`).
+    /// In output mode everything is recorded; the output formats decide
+    /// what to report.
     fn probe(ctx: *Ctx, node: *Node, inst: *const Value, annot: ?*Annotations) ValidateError!bool {
         const saved = ctx.collect;
-        ctx.collect = false;
+        if (!ctx.output) ctx.collect = false;
         defer ctx.collect = saved;
         return ctx.eval(node, inst, annot);
     }
@@ -987,6 +1275,40 @@ const Ctx = struct {
     }
 
     fn eval(ctx: *Ctx, node: *Node, inst: *const Value, annot: ?*Annotations) ValidateError!bool {
+        // Where this subschema sits on the evaluation path.
+        const kw_loc = if (ctx.tracking()) try ctx.childKwLoc(node) else "";
+        ctx.via_ref = null;
+        const saved_kw_loc = ctx.kw_loc;
+        const saved_node = ctx.cur_node;
+        const saved_unit = ctx.unit;
+        ctx.kw_loc = kw_loc;
+        ctx.cur_node = node;
+        defer {
+            ctx.kw_loc = saved_kw_loc;
+            ctx.cur_node = saved_node;
+            ctx.unit = saved_unit;
+        }
+        var unit: ?*Unit = null;
+        if (ctx.output) {
+            const u = try ctx.allocator.create(Unit);
+            u.* = .{
+                .keyword_location = kw_loc,
+                .absolute_keyword_location = try ctx.absoluteLocation(node, ""),
+                .instance_location = try ctx.instanceLocation(),
+            };
+            if (saved_unit) |parent| try parent.children.append(ctx.allocator, u);
+            ctx.unit = u;
+            unit = u;
+        }
+        const valid = try ctx.evalNode(node, inst, annot);
+        if (unit) |u| {
+            u.valid = valid;
+            if (valid) for (node.annotations) |an| try ctx.annotate(node, an.keyword, an.value.*);
+        }
+        return valid;
+    }
+
+    fn evalNode(ctx: *Ctx, node: *Node, inst: *const Value, annot: ?*Annotations) ValidateError!bool {
         switch (node.kind) {
             .always_true => return true,
             .always_false => {
@@ -1030,6 +1352,7 @@ const Ctx = struct {
         switch (kw) {
             .ref => |r| {
                 const target = try ctx.validator.resolveRef(r);
+                ctx.via_ref = "$ref";
                 return ctx.evalInPlace(target, inst, annot);
             },
             .dynamic_ref => |dr| {
@@ -1048,6 +1371,7 @@ const Ctx = struct {
                         }
                     }
                 }
+                ctx.via_ref = "$dynamicRef";
                 return ctx.evalInPlace(target, inst, annot);
             },
             .recursive_ref => |r| {
@@ -1060,6 +1384,7 @@ const Ctx = struct {
                         }
                     }
                 }
+                ctx.via_ref = "$recursiveRef";
                 return ctx.evalInPlace(target, inst, annot);
             },
             .type => |ts| {
@@ -1080,7 +1405,7 @@ const Ctx = struct {
             .multiple_of => |m| {
                 const n = numOf(inst.*) orelse return true;
                 if (isMultipleOf(n, m)) return true;
-                try ctx.fail(node, "multipleOf", "{d} is not a multiple of {d}", .{ n.toF64(), m.toF64() });
+                try ctx.fail(node, "multipleOf", "{f} is not a multiple of {f}", .{ n, m });
                 return false;
             },
             .maximum => |m| {
@@ -1088,9 +1413,9 @@ const Ctx = struct {
                 const ord = compareNum(n, m.limit);
                 if (ord == .lt or (ord == .eq and !m.exclusive)) return true;
                 if (m.exclusive) {
-                    try ctx.fail(node, "exclusiveMaximum", "{d} is not less than {d}", .{ n.toF64(), m.limit.toF64() });
+                    try ctx.fail(node, "exclusiveMaximum", "{f} is not less than {f}", .{ n, m.limit });
                 } else {
-                    try ctx.fail(node, "maximum", "{d} is greater than the maximum {d}", .{ n.toF64(), m.limit.toF64() });
+                    try ctx.fail(node, "maximum", "{f} is greater than the maximum {f}", .{ n, m.limit });
                 }
                 return false;
             },
@@ -1099,9 +1424,9 @@ const Ctx = struct {
                 const ord = compareNum(n, m.limit);
                 if (ord == .gt or (ord == .eq and !m.exclusive)) return true;
                 if (m.exclusive) {
-                    try ctx.fail(node, "exclusiveMinimum", "{d} is not greater than {d}", .{ n.toF64(), m.limit.toF64() });
+                    try ctx.fail(node, "exclusiveMinimum", "{f} is not greater than {f}", .{ n, m.limit });
                 } else {
-                    try ctx.fail(node, "minimum", "{d} is less than the minimum {d}", .{ n.toF64(), m.limit.toF64() });
+                    try ctx.fail(node, "minimum", "{f} is less than the minimum {f}", .{ n, m.limit });
                 }
                 return false;
             },
@@ -1121,7 +1446,7 @@ const Ctx = struct {
             },
             .pattern => |p| {
                 if (inst.* != .string) return true;
-                if (try p.regex.isMatch(a, inst.string)) return true;
+                if (try p.regex.isMatchLimited(a, inst.string, ctx.validator.options.regex_step_limit)) return true;
                 try ctx.fail(node, "pattern", "string does not match pattern \"{s}\"", .{p.source});
                 return false;
             },
@@ -1175,18 +1500,36 @@ const Ctx = struct {
                     an.items_prefix = @max(an.items_prefix, @min(items.len, it.prefix.len));
                     if (it.rest != null) an.all_items = true;
                 };
+                if (ok and ctx.output) {
+                    // The largest index the prefix applied to, or true if
+                    // it applied to every item; true if `rest` applied.
+                    const applied = @min(items.len, it.prefix.len);
+                    if (applied > 0) {
+                        const all = applied == items.len;
+                        try ctx.annotate(node, it.prefix_keyword, if (all) .{ .bool = true } else .{ .integer = @intCast(applied - 1) });
+                    }
+                    if (it.rest != null and items.len > it.prefix.len) try ctx.annotate(node, it.rest_keyword, .{ .bool = true });
+                }
                 return ok;
             },
             .contains => |c| {
                 if (inst.* != .array) return true;
                 var count: u64 = 0;
+                var matching: std.json.Array = .init(a);
                 for (inst.array.items, 0..) |*item, i| {
+                    try ctx.path.append(a, .{ .index = i });
+                    defer _ = ctx.path.pop();
                     if (try ctx.probe(c.node, item, null)) {
                         count += 1;
+                        if (ctx.output) try matching.append(.{ .integer = @intCast(i) });
                         if (annot) |an| {
                             if (node.resource.draft == .draft2020_12) try an.items_set.put(a, i, {});
                         }
                     }
+                }
+                // 2020-12: the indices `contains` matched.
+                if (ctx.output and node.resource.draft == .draft2020_12 and count >= c.min and (c.max == null or count <= c.max.?)) {
+                    try ctx.annotate(node, "contains", .{ .array = matching });
                 }
                 if (count < c.min) {
                     if (c.min == 1) {
@@ -1228,8 +1571,10 @@ const Ctx = struct {
             .properties => |props| {
                 if (inst.* != .object) return true;
                 var ok = true;
+                var applied: std.ArrayList([]const u8) = .empty;
                 for (props) |p| {
                     const child = inst.object.getPtr(p.name) orelse continue;
+                    if (ctx.output) try applied.append(a, p.name);
                     if (try ctx.evalAt(.{ .key = p.name }, p.node, child)) {
                         if (annot) |an| try an.props.put(a, p.name, {});
                     } else {
@@ -1237,15 +1582,22 @@ const Ctx = struct {
                         if (!ctx.collect) return false;
                     }
                 }
+                if (ok and ctx.output) try ctx.annotate(node, "properties", try ctx.namesValue(applied.items));
                 return ok;
             },
             .pattern_properties => |pats| {
                 if (inst.* != .object) return true;
                 var ok = true;
+                var applied: std.ArrayList([]const u8) = .empty;
                 var it = inst.object.iterator();
                 while (it.next()) |e| {
+                    var counted = false;
                     for (pats) |p| {
-                        if (!try p.regex.isMatch(a, e.key_ptr.*)) continue;
+                        if (!try p.regex.isMatchLimited(a, e.key_ptr.*, ctx.validator.options.regex_step_limit)) continue;
+                        if (ctx.output and !counted) {
+                            try applied.append(a, e.key_ptr.*);
+                            counted = true;
+                        }
                         if (try ctx.evalAt(.{ .key = e.key_ptr.* }, p.node, e.value_ptr)) {
                             if (annot) |an| try an.props.put(a, e.key_ptr.*, {});
                         } else {
@@ -1254,16 +1606,19 @@ const Ctx = struct {
                         }
                     }
                 }
+                if (ok and ctx.output) try ctx.annotate(node, "patternProperties", try ctx.namesValue(applied.items));
                 return ok;
             },
             .additional_properties => |ap| {
                 if (inst.* != .object) return true;
                 var ok = true;
+                var applied: std.ArrayList([]const u8) = .empty;
                 var it = inst.object.iterator();
                 outer: while (it.next()) |e| {
                     const key = e.key_ptr.*;
                     for (ap.names) |n| if (std.mem.eql(u8, n, key)) continue :outer;
-                    for (ap.patterns) |*re| if (try re.isMatch(a, key)) continue :outer;
+                    for (ap.patterns) |*re| if (try re.isMatchLimited(a, key, ctx.validator.options.regex_step_limit)) continue :outer;
+                    if (ctx.output) try applied.append(a, key);
                     if (ap.node.kind == .always_false) {
                         try ctx.fail(node, "additionalProperties", "additional property \"{s}\" is not allowed", .{key});
                     } else if (try ctx.evalAt(.{ .key = key }, ap.node, e.value_ptr)) {
@@ -1273,6 +1628,7 @@ const Ctx = struct {
                     ok = false;
                     if (!ctx.collect) return false;
                 }
+                if (ok and ctx.output) try ctx.annotate(node, "additionalProperties", try ctx.namesValue(applied.items));
                 return ok;
             },
             .property_names => |pn| {
@@ -1300,14 +1656,14 @@ const Ctx = struct {
                 }
                 return ok;
             },
-            .dependent_required => |deps| {
+            .dependent_required => |dr| {
                 if (inst.* != .object) return true;
                 var ok = true;
-                for (deps) |dep| {
+                for (dr.deps) |dep| {
                     if (!inst.object.contains(dep.name)) continue;
                     for (dep.list) |n| {
                         if (!inst.object.contains(n)) {
-                            try ctx.fail(node, "dependentRequired", "property \"{s}\" is required when \"{s}\" is present", .{ n, dep.name });
+                            try ctx.fail(node, dr.keyword, "property \"{s}\" is required when \"{s}\" is present", .{ n, dep.name });
                             ok = false;
                             if (!ctx.collect) return false;
                         }
@@ -1353,8 +1709,8 @@ const Ctx = struct {
                     if (try ctx.probeInPlace(n, inst, annot)) {
                         ok = true;
                         // Keep going only if later branches may still add
-                        // annotations that `unevaluated*` needs.
-                        if (annot == null) break;
+                        // annotations (for `unevaluated*`, or the output).
+                        if (annot == null and !ctx.output) break;
                     }
                 }
                 if (!ok) try ctx.fail(node, "anyOf", "value does not match any of the anyOf schemas", .{});
@@ -1368,7 +1724,7 @@ const Ctx = struct {
                     if (try ctx.probeInPlace(n, inst, annot)) {
                         matched += 1;
                         if (matched == 1) first = i else if (matched == 2) second = i;
-                        if (matched > 1 and annot == null) break;
+                        if (matched > 1 and annot == null and !ctx.output) break;
                     }
                 }
                 if (matched == 1) return true;
@@ -1386,7 +1742,9 @@ const Ctx = struct {
             },
             .conditional => |c| {
                 var if_annot: Annotations = .{};
-                if (try ctx.probe(c.@"if", inst, if (annot != null) &if_annot else null)) {
+                const if_valid = try ctx.probe(c.@"if", inst, if (annot != null) &if_annot else null);
+                ctx.markLastProbeOnly();
+                if (if_valid) {
                     if (annot) |an| try an.merge(a, &if_annot);
                     if (c.then) |t| return ctx.evalInPlace(t, inst, annot);
                 } else {
@@ -1407,15 +1765,18 @@ const Ctx = struct {
                     if (!ctx.collect) return false;
                 }
                 if (ok) an.all_items = true;
+                if (ok and ctx.output) try ctx.annotate(node, "unevaluatedItems", .{ .bool = true });
                 return ok;
             },
             .unevaluated_properties => |up| {
                 if (inst.* != .object) return true;
                 const an = annot.?;
                 var ok = true;
+                var applied: std.ArrayList([]const u8) = .empty;
                 var it = inst.object.iterator();
                 while (it.next()) |e| {
                     if (an.hasProp(e.key_ptr.*)) continue;
+                    if (ctx.output) try applied.append(a, e.key_ptr.*);
                     if (up.kind == .always_false) {
                         try ctx.fail(node, "unevaluatedProperties", "unevaluated property \"{s}\" is not allowed", .{e.key_ptr.*});
                     } else if (try ctx.evalAt(.{ .key = e.key_ptr.* }, up, e.value_ptr)) continue;
@@ -1423,6 +1784,7 @@ const Ctx = struct {
                     if (!ctx.collect) return false;
                 }
                 if (ok) an.all_props = true;
+                if (ok and ctx.output) try ctx.annotate(node, "unevaluatedProperties", try ctx.namesValue(applied.items));
                 return ok;
             },
         }
@@ -1535,7 +1897,12 @@ fn numOf(v: Value) ?Num {
     return switch (v) {
         .integer => |i| .{ .int = i },
         .float => |f| .{ .float = f },
-        .number_string => |s| .{ .float = std.fmt.parseFloat(f64, s) catch return null },
+        // Integers beyond i64 (std.json keeps them as strings) stay exact
+        // while they fit in 256 bits.
+        .number_string => |s| if (std.fmt.parseInt(i256, s, 10)) |i|
+            .{ .int = i }
+        else |_|
+            .{ .float = std.fmt.parseFloat(f64, s) catch return null },
         else => null,
     };
 }
@@ -1559,12 +1926,58 @@ fn parseStringList(allocator: Allocator, v: Value) CompileError![]const []const 
 }
 
 fn compareNum(a: Num, b: Num) std.math.Order {
-    if (a == .int and b == .int) return std.math.order(a.int, b.int);
-    return std.math.order(a.toF64(), b.toF64());
+    return switch (a) {
+        .int => |x| switch (b) {
+            .int => |y| std.math.order(x, y),
+            .float => |y| compareIntFloat(x, y),
+        },
+        .float => |x| switch (b) {
+            .int => |y| compareIntFloat(y, x).invert(),
+            .float => |y| std.math.order(x, y),
+        },
+    };
+}
+
+/// Exact comparison of an integer with a float (converting the integer to
+/// f64 would round, e.g. 2^64 - 1 to 2^64).
+pub fn compareIntFloat(x: i256, y: f64) std.math.Order {
+    if (std.math.isNan(y)) return .lt; // unreachable for JSON; any stable answer
+    // Every i256 lies in [-2^255, 2^255), both ends exact in f64.
+    if (y >= 0x1p255) return .lt;
+    if (y < -0x1p255) return .gt;
+    const floor_y = @floor(y);
+    const yi = integralToInt(floor_y);
+    if (x != yi) return std.math.order(x, yi);
+    return if (floor_y == y) .eq else .lt;
+}
+
+// LLVM cannot lower int<->float conversions of 256-bit integers on every
+// target, so these two go through i128 or the float's bits.
+
+/// `y` must be an integer value with |y| < 2^255.
+pub fn integralToInt(y: f64) i256 {
+    if (@abs(y) < 0x1p127) return @as(i128, @intFromFloat(y));
+    // |y| >= 2^127: mantissa * 2^(exponent - 52), an exact shift.
+    const bits: u64 = @bitCast(y);
+    const exponent: u9 = @intCast(((bits >> 52) & 0x7ff) - 1075);
+    const mantissa: i256 = @intCast((bits & ((1 << 52) - 1)) | (1 << 52));
+    const magnitude = mantissa << @intCast(exponent);
+    return if (y < 0) -magnitude else magnitude;
+}
+
+/// Nearest f64 (up to a rounding step for values beyond i128).
+pub fn intToF64(x: i256) f64 {
+    if (std.math.cast(i128, x)) |small| return @floatFromInt(small);
+    const shift = 128;
+    const high: i128 = @intCast(x >> shift);
+    return std.math.ldexp(@as(f64, @floatFromInt(high)), shift);
 }
 
 fn isMultipleOf(n: Num, m: Num) bool {
-    if (n == .int and m == .int) return @rem(n.int, m.int) == 0;
+    if (n == .int and m == .int) {
+        if (m.int == 1 or m.int == -1) return true; // avoids @rem(minInt, -1)
+        return @rem(n.int, m.int) == 0;
+    }
     const x = n.toF64();
     const y = m.toF64();
     if (y == 0) return false;
@@ -1680,4 +2093,82 @@ test "validator: remote documents, metaschema checks and dialects" {
     );
     try std.testing.expect(!try d4.isValid(.{ .integer = 3 }));
     try std.testing.expect(try d4.isValid(.{ .integer = 2 }));
+}
+
+test "validator: output formats and locations through references" {
+    var v = Validator.init(std.testing.allocator, .{});
+    defer v.deinit();
+    const schema = try v.compileJson(
+        \\{
+        \\  "$id": "https://example.com/order.json",
+        \\  "title": "Order",
+        \\  "properties": {
+        \\    "qty": {"$ref": "#/$defs/count"},
+        \\    "code": {"anyOf": [{"type": "integer"}, {"type": "string", "description": "a code"}]},
+        \\    "kind": {"if": {"const": "x"}, "then": {"minLength": 5}}
+        \\  },
+        \\  "$defs": {"count": {"type": "integer", "minimum": 1}}
+        \\}
+    );
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Errors: the evaluation path goes through `$ref`; the absolute location
+    // is where the keyword really is.
+    const bad = try std.json.parseFromSliceLeaky(Value, a,
+        \\{"qty": 0, "code": "c", "kind": "y"}
+    , .{});
+    const result = try schema.validate(a, bad);
+    try std.testing.expectEqual(@as(usize, 1), result.errors.len);
+    try std.testing.expectEqualStrings("/properties/qty/$ref/minimum", result.errors[0].keyword_location);
+    try std.testing.expectEqualStrings("https://example.com/order.json#/$defs/count/minimum", result.errors[0].absolute_keyword_location);
+    try std.testing.expectEqualStrings("/qty", result.errors[0].instance_location);
+
+    const flag = try schema.output(a, bad, .flag);
+    try std.testing.expectEqual(false, flag.object.get("valid").?.bool);
+    try std.testing.expectEqual(@as(usize, 1), flag.object.count());
+
+    // basic: only the error that caused the failure (the failed `if` and the
+    // failed `anyOf` branch next to a passing one are not errors).
+    const basic = try schema.output(a, bad, .basic);
+    const errors = basic.object.get("errors").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), errors.len);
+    try std.testing.expectEqualStrings("/properties/qty/$ref/minimum", errors[0].object.get("keywordLocation").?.string);
+    try std.testing.expect(errors[0].object.get("error") != null);
+    try std.testing.expect(basic.object.get("annotations") == null);
+
+    // detailed: the chain properties/qty -> $ref -> minimum is collapsed.
+    const detailed = try schema.output(a, bad, .detailed);
+    const d_errors = detailed.object.get("errors").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), d_errors.len);
+    try std.testing.expectEqualStrings("/properties/qty/$ref/minimum", d_errors[0].object.get("keywordLocation").?.string);
+
+    // verbose: every evaluated subschema, including valid ones.
+    const verbose = try schema.output(a, bad, .verbose);
+    try std.testing.expect(verbose.object.get("errors").?.array.items.len > 1);
+
+    // Valid: annotations from every passing subschema (here the second
+    // `anyOf` branch's description), none from failed ones.
+    const good = try std.json.parseFromSliceLeaky(Value, a,
+        \\{"qty": 2, "code": "c", "kind": "y"}
+    , .{});
+    const annotated = try schema.output(a, good, .basic);
+    try std.testing.expect(annotated.object.get("valid").?.bool);
+    var saw_title = false;
+    var saw_description = false;
+    var saw_properties = false;
+    for (annotated.object.get("annotations").?.array.items) |u| {
+        const loc = u.object.get("keywordLocation").?.string;
+        if (std.mem.eql(u8, loc, "/title")) saw_title = true;
+        if (std.mem.eql(u8, loc, "/properties/code/anyOf/1/description")) {
+            saw_description = true;
+            try std.testing.expectEqualStrings("/code", u.object.get("instanceLocation").?.string);
+        }
+        if (std.mem.eql(u8, loc, "/properties")) {
+            saw_properties = true;
+            try std.testing.expectEqual(@as(usize, 3), u.object.get("annotation").?.array.items.len);
+        }
+    }
+    try std.testing.expect(saw_title and saw_description and saw_properties);
 }
