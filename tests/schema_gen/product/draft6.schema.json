@@ -1,0 +1,53 @@
+{
+  "$schema": "http://json-schema.org/draft-06/schema#",
+  "type": "object",
+  "properties": {
+    "name": {
+      "type": "string",
+      "title": "Name",
+      "minLength": 1,
+      "maxLength": 100
+    },
+    "price": {
+      "type": "number",
+      "title": "Price",
+      "description": "Unit price in JPY, must be positive",
+      "minimum": 0,
+      "exclusiveMinimum": 0
+    },
+    "quantity": {
+      "type": "integer",
+      "default": 1,
+      "minimum": 0,
+      "maximum": 1000
+    },
+    "discount": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "minimum": 0,
+      "maximum": 1
+    },
+    "in_stock": {
+      "type": "boolean",
+      "title": "In stock",
+      "default": true
+    },
+    "tags": {
+      "type": "array",
+      "title": "Tags",
+      "minItems": 1,
+      "maxItems": 5,
+      "uniqueItems": true,
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "name",
+    "price",
+    "tags"
+  ]
+}

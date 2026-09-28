@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "exclusive_only": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "exclusiveMaximum": 1
+    },
+    "exclusive_stricter": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 100,
+      "exclusiveMinimum": 5,
+      "exclusiveMaximum": 50
+    },
+    "inclusive_stricter": {
+      "type": "number",
+      "minimum": 10,
+      "maximum": 20,
+      "exclusiveMinimum": 5,
+      "exclusiveMaximum": 50
+    },
+    "equal_bounds": {
+      "type": "integer",
+      "minimum": 0,
+      "exclusiveMinimum": 0
+    },
+    "step": {
+      "type": "number",
+      "multipleOf": 0.5
+    },
+    "plain_int": {
+      "type": "integer"
+    },
+    "plain_float": {
+      "type": "number"
+    }
+  },
+  "required": [
+    "exclusive_only",
+    "exclusive_stricter",
+    "inclusive_stricter",
+    "equal_bounds",
+    "step",
+    "plain_int",
+    "plain_float"
+  ]
+}

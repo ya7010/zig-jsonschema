@@ -1,0 +1,49 @@
+{
+  "$schema": "http://json-schema.org/draft-04/schema#",
+  "type": "object",
+  "properties": {
+    "exclusive_only": {
+      "type": "number",
+      "minimum": 0,
+      "exclusiveMinimum": true,
+      "maximum": 1,
+      "exclusiveMaximum": true
+    },
+    "exclusive_stricter": {
+      "type": "number",
+      "minimum": 5,
+      "exclusiveMinimum": true,
+      "maximum": 50,
+      "exclusiveMaximum": true
+    },
+    "inclusive_stricter": {
+      "type": "number",
+      "minimum": 10,
+      "maximum": 20
+    },
+    "equal_bounds": {
+      "type": "integer",
+      "minimum": 0,
+      "exclusiveMinimum": true
+    },
+    "step": {
+      "type": "number",
+      "multipleOf": 0.5
+    },
+    "plain_int": {
+      "type": "integer"
+    },
+    "plain_float": {
+      "type": "number"
+    }
+  },
+  "required": [
+    "exclusive_only",
+    "exclusive_stricter",
+    "inclusive_stricter",
+    "equal_bounds",
+    "step",
+    "plain_int",
+    "plain_float"
+  ]
+}

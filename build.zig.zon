@@ -1,0 +1,14 @@
+.{
+    .name = .zig_jsonschema,
+    .version = "0.0.1",
+    .dependencies = .{
+        .@"JSON-Schema-Test-Suite" = .{
+            .url = "git+https://github.com/json-schema-org/JSON-Schema-Test-Suite#5b0ee1613e45fcc2bddac00e07c19cd49b00d8a8",
+            .hash = "N-V-__8AAMZ5LQAuZITmdlsIbUBqY5S94F8XFZWyYzXIlFEG",
+            .lazy = true,
+        },
+    },
+    .minimum_zig_version = "0.16.0",
+    .paths = .{""},
+    .fingerprint = 0x3ec623d4a38ec3c,
+}
