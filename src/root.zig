@@ -123,8 +123,9 @@ pub const ObjectConstraints = struct {
     minProperties: ?usize = null,
     maxProperties: ?usize = null,
     /// `false` rejects JSON object keys that don't match any struct field
-    /// (checked by `fromJson`). `true`/`null` allow them (the JSON Schema
-    /// default), matching this library's existing lenient decoding.
+    /// (checked by `fromJson`), `true` allows them. `null` defers to
+    /// `SchemaOptions.unknown_fields` (which allows them by default, like
+    /// JSON Schema itself).
     additionalProperties: ?bool = null,
 };
 
@@ -270,13 +271,34 @@ fn isOptionalField(comptime f: std.builtin.Type.StructField) bool {
 }
 
 /// Options for `toSchemaWithOptions`.
+/// Options shared by schema generation (`toSchemaWithOptions`) and
+/// decoding (`fromJsonWithOptions`), so that a generated schema accepts
+/// exactly what `fromJson` accepts when both use the same options.
 pub const SchemaOptions = struct {
-    /// JSON Schema version (dialect) to generate.
+    /// JSON Schema version (dialect) to generate. Generation only.
     draft: Draft = .draft2020_12,
     /// Emit `$schema` at the root, so consumers know which dialect the
-    /// schema is written in.
+    /// schema is written in. Generation only.
     emit_schema_uri: bool = true,
+    /// How JSON object keys that match no struct field are treated, for
+    /// every object whose `Field()` does not set `additionalProperties`
+    /// explicitly (an explicit setting always wins).
+    unknown_fields: UnknownFields = .allow,
 };
+
+pub const UnknownFields = enum {
+    /// Accept and ignore them (the JSON Schema default); nothing is emitted.
+    allow,
+    /// Reject them; `"additionalProperties": false` is emitted.
+    deny,
+};
+
+fn additionalPropertiesFor(explicit: ?bool, options: SchemaOptions) ?bool {
+    return explicit orelse switch (options.unknown_fields) {
+        .allow => null,
+        .deny => false,
+    };
+}
 
 /// Builds a JSON Schema (draft 2020-12, without `$schema`) from type
 /// `Schema` at comptime. Every `std.json.Value` in the result is owned by
@@ -446,7 +468,9 @@ fn buildObjectSchema(comptime StructT: type, constraints: ObjectConstraints, opt
     }
     if (constraints.minProperties) |v| try obj.put(allocator, "minProperties", .{ .integer = @intCast(v) });
     if (constraints.maxProperties) |v| try obj.put(allocator, "maxProperties", .{ .integer = @intCast(v) });
-    if (constraints.additionalProperties) |v| try obj.put(allocator, "additionalProperties", .{ .bool = v });
+    if (additionalPropertiesFor(constraints.additionalProperties, options)) |v| {
+        try obj.put(allocator, "additionalProperties", .{ .bool = v });
+    }
     return .{ .object = obj };
 }
 
@@ -677,6 +701,17 @@ pub fn FromJsonResult(comptime T: type) type {
 }
 
 pub fn fromJson(comptime Schema: type, allocator: Allocator, json_text: []const u8) Allocator.Error!FromJsonResult(Unwrap(Schema)) {
+    return fromJsonWithOptions(Schema, allocator, json_text, .{});
+}
+
+/// Like `fromJson`, but honours `options.unknown_fields` (the generation-only
+/// fields of `SchemaOptions` are ignored).
+pub fn fromJsonWithOptions(
+    comptime Schema: type,
+    allocator: Allocator,
+    json_text: []const u8,
+    options: SchemaOptions,
+) Allocator.Error!FromJsonResult(Unwrap(Schema)) {
     var errors: std.ArrayList(ValidationError) = .empty;
 
     const json_value = std.json.parseFromSliceLeaky(std.json.Value, allocator, json_text, .{}) catch |err| {
@@ -684,7 +719,7 @@ pub fn fromJson(comptime Schema: type, allocator: Allocator, json_text: []const 
         return .{ .value = null, .errors = errors };
     };
 
-    const decoded: ?Unwrap(Schema) = decodeValue(Schema, json_value, "", allocator, &errors) catch |err| switch (err) {
+    const decoded: ?Unwrap(Schema) = decodeValue(Schema, json_value, "", null, options, allocator, &errors) catch |err| switch (err) {
         error.Invalid => null,
         else => |e| return e,
     };
@@ -698,36 +733,27 @@ pub fn fromJson(comptime Schema: type, allocator: Allocator, json_text: []const 
 
 const DecodeError = error{Invalid} || Allocator.Error;
 
+/// `additional` is the explicit `additionalProperties` of the `Field()`
+/// labelling this value (if it is an object), or null.
 fn decodeValue(
     comptime Schema: type,
     value: std.json.Value,
     path: []const u8,
+    additional: ?bool,
+    options: SchemaOptions,
     allocator: Allocator,
     errors: *std.ArrayList(ValidationError),
 ) DecodeError!Unwrap(Schema) {
     if (comptime isField(Schema)) {
-        const Inner = Schema.zjs_inner;
-
-        var extra_found = false;
-        if (comptime @typeInfo(Inner) == .@"struct") {
-            if (Schema.zjs_constraints.additionalProperties == false and value == .object) {
-                extra_found = try reportAdditionalProperties(Inner, value.object, path, allocator, errors);
-            }
-        }
-
-        const decoded: ?Unwrap(Inner) = decodeValue(Inner, value, path, allocator, errors) catch |err| switch (err) {
-            error.Invalid => null,
-            else => |e| return e,
-        };
-
-        if (extra_found or decoded == null) return error.Invalid;
-        return decoded.?;
+        const c = Schema.zjs_constraints;
+        const explicit: ?bool = if (comptime @TypeOf(c) == ObjectConstraints) c.additionalProperties else null;
+        return decodeValue(Schema.zjs_inner, value, path, explicit, options, allocator, errors);
     }
 
     switch (@typeInfo(Schema)) {
         .optional => |info| {
             if (value == .null) return @as(Unwrap(Schema), null);
-            return try decodeValue(info.child, value, path, allocator, errors);
+            return try decodeValue(info.child, value, path, additional, options, allocator, errors);
         },
         .bool => {
             switch (value) {
@@ -782,7 +808,7 @@ fn decodeValue(
 
                 for (items, 0..) |item_value, i| {
                     const idx_path = try childPath(path, try std.fmt.allocPrint(allocator, "{d}", .{i}), allocator);
-                    if (decodeValue(info.child, item_value, idx_path, allocator, errors)) |decoded| {
+                    if (decodeValue(info.child, item_value, idx_path, null, options, allocator, errors)) |decoded| {
                         buf[i] = decoded;
                     } else |err| switch (err) {
                         error.Invalid => any_failed = true,
@@ -803,11 +829,14 @@ fn decodeValue(
 
             var result: Unwrap(Schema) = undefined;
             var any_failed = false;
+            if (additionalPropertiesFor(additional, options) == false) {
+                any_failed = try reportAdditionalProperties(Schema, value.object, path, allocator, errors);
+            }
 
             inline for (info.fields) |f| {
                 const child_path = try childPath(path, f.name, allocator);
                 if (value.object.get(f.name)) |sub_value| {
-                    if (decodeValue(f.type, sub_value, child_path, allocator, errors)) |decoded| {
+                    if (decodeValue(f.type, sub_value, child_path, null, options, allocator, errors)) |decoded| {
                         @field(result, f.name) = decoded;
                     } else |err| switch (err) {
                         error.Invalid => any_failed = true,
@@ -1291,21 +1320,28 @@ test "toSchemaWithOptions output is valid for every draft and matches fromJson" 
         ,
         \\{"price": 1, "tags": ["a"]}
         ,
+        // Unknown keys, at the top level and in a nested object.
+        \\{"name": "Widget", "price": 1, "tags": ["a"], "colour": "red"}
+        ,
+        \\{"name": "Widget", "price": 1, "tags": ["a"], "billing": {"zip": "1", "city": "X"}}
+        ,
     };
 
     inline for (std.meta.fields(Draft)) |f| {
-        const draft: Draft = @enumFromInt(f.value);
-        const generated = try toSchemaWithOptions(Product, allocator, .{ .draft = draft });
+        for ([_]UnknownFields{ .allow, .deny }) |mode| {
+            const options: SchemaOptions = .{ .draft = @enumFromInt(f.value), .unknown_fields = mode };
+            const generated = try toSchemaWithOptions(Product, allocator, options);
 
-        // The runtime validator picks the dialect up from `$schema`, not from its default.
-        var v = Validator.init(std.testing.allocator, .{ .default_draft = .draft2020_12 });
-        defer v.deinit();
-        try std.testing.expect(try v.isValidSchema(generated));
-        const schema = try v.compile(generated);
-        for (cases) |text| {
-            const via_comptime = (try fromJson(Product, allocator, text)).value != null;
-            const instance = try std.json.parseFromSliceLeaky(std.json.Value, allocator, text, .{});
-            try std.testing.expectEqual(via_comptime, try schema.isValid(instance));
+            // The runtime validator picks the dialect up from `$schema`, not from its default.
+            var v = Validator.init(std.testing.allocator, .{ .default_draft = .draft2020_12 });
+            defer v.deinit();
+            try std.testing.expect(try v.isValidSchema(generated));
+            const schema = try v.compile(generated);
+            for (cases) |text| {
+                const via_comptime = (try fromJsonWithOptions(Product, allocator, text, options)).value != null;
+                const instance = try std.json.parseFromSliceLeaky(std.json.Value, allocator, text, .{});
+                try std.testing.expectEqual(via_comptime, try schema.isValid(instance));
+            }
         }
     }
 }
@@ -1331,4 +1367,53 @@ test "toSchema makes optional types nullable" {
     try std.testing.expectEqualStrings("null", props.get("note").?.object.get("type").?.array.items[1].string);
     // Optional fields may also be omitted.
     try std.testing.expect(schema.object.get("required") == null);
+}
+
+test "unknown_fields = .deny rejects unknown keys at every level unless a Field allows them" {
+    const Inner = struct { zip: []const u8 };
+    const Product = struct {
+        name: []const u8,
+        billing: ?Inner,
+        items: []const Inner,
+        extras: Field(struct { source: []const u8 }, .{ .additionalProperties = true }),
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const deny: SchemaOptions = .{ .unknown_fields = .deny };
+
+    const ok =
+        \\{"name": "W", "billing": null, "items": [{"zip": "1"}], "extras": {"source": "s", "free": 1}}
+    ;
+    try std.testing.expect((try fromJsonWithOptions(Product, a, ok, deny)).value != null);
+
+    const bad =
+        \\{"name": "W", "top": 1, "billing": {"zip": "1", "city": "X"}, "items": [{"zip": "1", "n": 2}], "extras": {"source": "s"}}
+    ;
+    const result = try fromJsonWithOptions(Product, a, bad, deny);
+    try std.testing.expect(result.value == null);
+    try std.testing.expectEqual(@as(usize, 3), result.errors.items.len);
+    try std.testing.expectEqualStrings("top", result.errors.items[0].path);
+    try std.testing.expectEqualStrings("billing.city", result.errors.items[1].path);
+    try std.testing.expectEqualStrings("items.0.n", result.errors.items[2].path);
+
+    // The default still ignores unknown keys.
+    try std.testing.expect((try fromJson(Product, a, bad)).value != null);
+
+    const schema = try toSchemaWithOptions(Product, a, deny);
+    try std.testing.expectEqual(false, schema.object.get("additionalProperties").?.bool);
+    const props = schema.object.get("properties").?.object;
+    try std.testing.expectEqual(false, props.get("billing").?.object.get("additionalProperties").?.bool);
+    try std.testing.expectEqual(true, props.get("extras").?.object.get("additionalProperties").?.bool);
+}
+
+test "an explicit additionalProperties = false also applies to optional objects" {
+    const Product = struct {
+        billing: Field(?struct { zip: []const u8 }, .{ .additionalProperties = false }),
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expect((try fromJson(Product, a, "{\"billing\": null}")).value != null);
+    try std.testing.expect((try fromJson(Product, a, "{\"billing\": {\"zip\": \"1\", \"x\": 1}}")).value == null);
 }

@@ -22,6 +22,11 @@ const drafts = [_]struct { name: []const u8, draft: js.Draft }{
 };
 
 fn checkCase(comptime case_name: []const u8, comptime Schema: type) !void {
+    return checkCaseWith(case_name, Schema, .{});
+}
+
+/// `base` supplies every option except `draft`, which is iterated.
+fn checkCaseWith(comptime case_name: []const u8, comptime Schema: type, base: js.SchemaOptions) !void {
     const io = std.testing.io;
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -33,7 +38,9 @@ fn checkCase(comptime case_name: []const u8, comptime Schema: type) !void {
 
     var mismatches: usize = 0;
     for (drafts) |d| {
-        const schema = try js.toSchemaWithOptions(Schema, arena, .{ .draft = d.draft });
+        var opts = base;
+        opts.draft = d.draft;
+        const schema = try js.toSchemaWithOptions(Schema, arena, opts);
         const actual = try std.fmt.allocPrint(arena, "{s}\n", .{
             try std.json.Stringify.valueAlloc(arena, schema, .{ .whitespace = .indent_2 }),
         });
@@ -148,4 +155,14 @@ test "nested_objects: structs, arrays of structs and object constraints" {
         metadata: Field(struct { source: []const u8 }, .{ .additionalProperties = true, .minProperties = 1 }),
         billing: ?Address,
     }, .{ .title = "Customer", .additionalProperties = false }));
+}
+
+test "unknown_fields_deny: additionalProperties false everywhere unless overridden" {
+    try checkCaseWith("unknown_fields_deny", struct {
+        address: Address,
+        previous: []const Address,
+        billing: ?Address,
+        /// An explicit setting wins over `unknown_fields`.
+        metadata: Field(struct { source: []const u8 }, .{ .additionalProperties = true }),
+    }, .{ .unknown_fields = .deny });
 }

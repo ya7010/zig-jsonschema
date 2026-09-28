@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "address": {
+      "type": "object",
+      "properties": {
+        "street": {
+          "type": "string",
+          "minLength": 1
+        },
+        "zip": {
+          "type": "string",
+          "pattern": "^[0-9]{3}-[0-9]{4}$"
+        }
+      },
+      "required": [
+        "street",
+        "zip"
+      ],
+      "additionalProperties": false
+    },
+    "previous": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "street": {
+            "type": "string",
+            "minLength": 1
+          },
+          "zip": {
+            "type": "string",
+            "pattern": "^[0-9]{3}-[0-9]{4}$"
+          }
+        },
+        "required": [
+          "street",
+          "zip"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "billing": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "properties": {
+        "street": {
+          "type": "string",
+          "minLength": 1
+        },
+        "zip": {
+          "type": "string",
+          "pattern": "^[0-9]{3}-[0-9]{4}$"
+        }
+      },
+      "required": [
+        "street",
+        "zip"
+      ],
+      "additionalProperties": false
+    },
+    "metadata": {
+      "type": "object",
+      "properties": {
+        "source": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "source"
+      ],
+      "additionalProperties": true
+    }
+  },
+  "required": [
+    "address",
+    "previous",
+    "metadata"
+  ],
+  "additionalProperties": false
+}
