@@ -115,8 +115,8 @@ pub const ArrayConstraints = struct {
 
     minItems: ?usize = null,
     maxItems: ?usize = null,
-    /// Enforced only for item types with an obvious notion of equality
-    /// (numbers, bools, strings); anything else is a compile error.
+    /// `fromJson` compares the JSON items (as JSON Schema does); `validate`
+    /// compares the Zig values structurally.
     uniqueItems: ?bool = null,
 };
 
@@ -652,6 +652,12 @@ fn buildSchema(comptime Schema: type, gen: *Gen) Allocator.Error!std.json.Value 
     if (comptime isField(Schema)) {
         return buildSchemaFor(Schema.zjs_inner, Schema.zjs_constraints, gen);
     }
+    // `?Email` where `Email = Field([]const u8, ...)`: the same as
+    // `Field(?[]const u8, ...)`.
+    if (comptime @typeInfo(Schema) == .optional and isField(@typeInfo(Schema).optional.child)) {
+        const F = @typeInfo(Schema).optional.child;
+        return buildSchemaFor(?F.zjs_inner, F.zjs_constraints, gen);
+    }
     return buildSchemaFor(Schema, ConstraintsFor(Schema){}, gen);
 }
 
@@ -1050,49 +1056,58 @@ pub fn validate(
     allocator: Allocator,
     errors: *std.ArrayList(ValidationError),
 ) Allocator.Error!void {
-    try validatePath(Schema, value, "", .as_is, allocator, errors);
+    try validatePath(Schema, value, "", .{}, allocator, errors);
 }
 
-/// `naming` spells the field names in error paths.
+/// How `validatePath` checks a value.
+const Check = struct {
+    /// Spelling of field names in error paths.
+    naming: FieldNaming = .as_is,
+    /// Check `uniqueItems` on the Zig values. `fromJson` checks it on the
+    /// JSON items instead: e.g. `{"a": null}` and `{}` are different JSON
+    /// values that decode to the same Zig value.
+    unique_items: bool = true,
+};
+
 fn validatePath(
     comptime Schema: type,
     value: Unwrap(Schema),
     path: []const u8,
-    naming: FieldNaming,
+    check: Check,
     allocator: Allocator,
     errors: *std.ArrayList(ValidationError),
 ) Allocator.Error!void {
     if (comptime isField(Schema)) {
-        try checkConstraints(Schema.zjs_inner, value, Schema.zjs_constraints, path, allocator, errors);
-        try validatePath(Schema.zjs_inner, value, path, naming, allocator, errors);
+        try checkConstraints(Schema.zjs_inner, value, Schema.zjs_constraints, path, check, allocator, errors);
+        try validatePath(Schema.zjs_inner, value, path, check, allocator, errors);
         return;
     }
 
     switch (@typeInfo(Schema)) {
         .int, .float, .bool, .@"enum" => {}, // leaf types: constraints (if any) were already applied above
         .optional => |info| {
-            if (value) |inner| try validatePath(info.child, inner, path, naming, allocator, errors);
+            if (value) |inner| try validatePath(info.child, inner, path, check, allocator, errors);
         },
         .pointer => |info| {
             if (info.size == .slice and info.child == u8) return; // string leaf
-            if (info.size == .one) return validatePath(info.child, value.*, path, naming, allocator, errors);
+            if (info.size == .one) return validatePath(info.child, value.*, path, check, allocator, errors);
             for (value, 0..) |elem, i| {
                 const idx_path = try childPath(path, try std.fmt.allocPrint(allocator, "{d}", .{i}), allocator);
-                try validatePath(info.child, elem, idx_path, naming, allocator, errors);
+                try validatePath(info.child, elem, idx_path, check, allocator, errors);
             }
         },
         .@"struct" => |info| {
             inline for (info.fields) |f| {
-                const child_path = try childPath(path, jsonName(f.name, naming), allocator);
-                try validatePath(f.type, @field(value, f.name), child_path, naming, allocator, errors);
+                const child_path = try childPath(path, jsonName(f.name, check.naming), allocator);
+                try validatePath(f.type, @field(value, f.name), child_path, check, allocator, errors);
             }
         },
         .@"union" => switch (value) {
             inline else => |payload, tag| {
                 const name = @tagName(tag);
                 // Internally tagged payload fields sit next to the tag.
-                const payload_path = if (comptime discriminatorOf(Schema) != null) path else try childPath(path, jsonName(name, naming), allocator);
-                try validatePath(@FieldType(Schema, name), payload, payload_path, naming, allocator, errors);
+                const payload_path = if (comptime discriminatorOf(Schema) != null) path else try childPath(path, jsonName(name, check.naming), allocator);
+                try validatePath(@FieldType(Schema, name), payload, payload_path, check, allocator, errors);
             },
         },
         .void => {},
@@ -1108,11 +1123,12 @@ fn checkConstraints(
     value: Unwrap(Inner),
     constraints: ConstraintsFor(Inner),
     path: []const u8,
+    check: Check,
     allocator: Allocator,
     errors: *std.ArrayList(ValidationError),
 ) Allocator.Error!void {
     if (comptime @typeInfo(Inner) == .optional) {
-        if (value) |v| try checkConstraints(@typeInfo(Inner).optional.child, v, constraints, path, allocator, errors);
+        if (value) |v| try checkConstraints(@typeInfo(Inner).optional.child, v, constraints, path, check, allocator, errors);
         return;
     }
 
@@ -1122,11 +1138,11 @@ fn checkConstraints(
         .bool => {}, // no assertion keywords for booleans in this MVP
         .pointer => |p| {
             if (p.size == .one) {
-                try checkConstraints(p.child, value.*, constraints, path, allocator, errors);
+                try checkConstraints(p.child, value.*, constraints, path, check, allocator, errors);
             } else if (p.size == .slice and p.child == u8) {
                 try checkStringConstraints(value, constraints, path, allocator, errors);
             } else {
-                try checkArrayConstraints(p.child, value, constraints, path, allocator, errors);
+                try checkArrayConstraints(p.child, value, constraints, path, check, allocator, errors);
             }
         },
         .@"struct" => try checkObjectConstraints(Inner, constraints, path, allocator, errors),
@@ -1219,6 +1235,7 @@ fn checkArrayConstraints(
     value: []const Unwrap(Item),
     constraints: ArrayConstraints,
     path: []const u8,
+    check: Check,
     allocator: Allocator,
     errors: *std.ArrayList(ValidationError),
 ) Allocator.Error!void {
@@ -1228,7 +1245,7 @@ fn checkArrayConstraints(
     if (constraints.maxItems) |max| {
         if (value.len > max) try addError(errors, allocator, path, "array has {d} items, more than maxItems {d}", .{ value.len, max });
     }
-    if (constraints.uniqueItems orelse false) {
+    if (check.unique_items and (constraints.uniqueItems orelse false)) {
         var i: usize = 0;
         while (i < value.len) : (i += 1) {
             var j: usize = i + 1;
@@ -1241,15 +1258,30 @@ fn checkArrayConstraints(
     }
 }
 
+/// Structural equality of plain values (for `uniqueItems` in `validate`).
 fn valuesEqual(comptime T: type, a: T, b: T) bool {
     return switch (@typeInfo(T)) {
         .int, .float, .bool, .@"enum" => a == b,
+        .void => true,
         .optional => |info| if (a == null or b == null) (a == null and b == null) else valuesEqual(info.child, a.?, b.?),
-        .pointer => |p| blk: {
-            if (p.size == .slice and p.child == u8) break :blk std.mem.eql(u8, a, b);
-            @compileError("zig-jsonschema: uniqueItems is not supported for array item type " ++ @typeName(T));
+        .pointer => |p| switch (p.size) {
+            .one => valuesEqual(p.child, a.*, b.*),
+            .slice => blk: {
+                if (p.child == u8) break :blk std.mem.eql(u8, a, b);
+                if (a.len != b.len) break :blk false;
+                for (a, b) |x, y| if (!valuesEqual(p.child, x, y)) break :blk false;
+                break :blk true;
+            },
+            else => @compileError("zig-jsonschema: unsupported pointer type " ++ @typeName(T)),
         },
-        else => @compileError("zig-jsonschema: uniqueItems is not supported for array item type " ++ @typeName(T)),
+        .@"struct" => |info| blk: {
+            inline for (info.fields) |f| if (!valuesEqual(f.type, @field(a, f.name), @field(b, f.name))) break :blk false;
+            break :blk true;
+        },
+        .@"union" => switch (a) {
+            inline else => |payload, tag| b == tag and valuesEqual(@TypeOf(payload), payload, @field(b, @tagName(tag))),
+        },
+        else => @compileError("zig-jsonschema: unsupported type " ++ @typeName(T)),
     };
 }
 
@@ -1310,7 +1342,7 @@ pub fn fromJson(
     };
 
     if (decoded) |value| {
-        try validatePath(Schema, value, "", options.field_naming, allocator, &errors);
+        try validatePath(Schema, value, "", .{ .naming = options.field_naming, .unique_items = false }, allocator, &errors);
         return .{ .value = if (errors.items.len == 0) value else null, .errors = errors };
     }
     return .{ .value = null, .errors = errors };
@@ -1332,7 +1364,11 @@ fn decodeValue(
     if (comptime isField(Schema)) {
         const c = Schema.zjs_constraints;
         const explicit: ?bool = if (comptime @TypeOf(c) == ObjectConstraints) c.additionalProperties else null;
-        return decodeValue(Schema.zjs_inner, value, path, explicit, options, allocator, errors);
+        const decoded = decodeValue(Schema.zjs_inner, value, path, explicit, options, allocator, errors);
+        if (comptime @TypeOf(c) == ArrayConstraints) {
+            if ((c.uniqueItems orelse false) and value == .array) try reportDuplicateItems(value.array.items, path, allocator, errors);
+        }
+        return decoded;
     }
 
     switch (@typeInfo(Schema)) {
@@ -1514,6 +1550,15 @@ fn decodeUnion(
     }
     try addError(errors, allocator, try childPath(path, key, allocator), "unknown variant", .{});
     return error.Invalid;
+}
+
+/// `uniqueItems`, on the JSON items: the same equality as the validator.
+fn reportDuplicateItems(items: []const std.json.Value, path: []const u8, allocator: Allocator, errors: *std.ArrayList(ValidationError)) Allocator.Error!void {
+    for (items, 0..) |x, i| {
+        for (items[i + 1 ..], i + 1..) |y, j| {
+            if (validator.jsonEqual(x, y)) try addError(errors, allocator, path, "array items at index {d} and {d} are not unique", .{ i, j });
+        }
+    }
 }
 
 /// Decodes a JSON integer into `T` (named `Named` in messages), accepting
@@ -2233,6 +2278,76 @@ test "string pattern and code point lengths agree between toSchema and fromJson"
     try std.testing.expectEqualStrings("string does not match pattern \"^[0-9]{3}-[0-9]{4}$\"", bad.errors.items[0].message);
 }
 
+test "named Field types can be made optional and used in arrays" {
+    const Email = Field([]const u8, .{ .pattern = "^[^@]+@[^@]+$" });
+    const T = struct { to: Email, cc: ?Email, bcc: []const Email };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const schema = try toSchema(T, a, .{});
+    const cc = schema.object.get("properties").?.object.get("cc").?.object;
+    try std.testing.expectEqualStrings("^[^@]+@[^@]+$", cc.get("pattern").?.string);
+    try std.testing.expectEqual(@as(usize, 2), cc.get("type").?.array.items.len);
+
+    const ok = (try fromJson(T, a,
+        \\{"to": "a@b", "cc": null, "bcc": ["c@d"]}
+    , .{})).value.?;
+    try std.testing.expect(ok.cc == null);
+    const bad = try fromJson(T, a,
+        \\{"to": "a@b", "cc": "nope", "bcc": ["c@d", "x"]}
+    , .{});
+    try std.testing.expectEqual(@as(usize, 2), bad.errors.items.len);
+    try std.testing.expectEqualStrings("cc", bad.errors.items[0].path);
+    try std.testing.expectEqualStrings("bcc.1", bad.errors.items[1].path);
+}
+
+test "uniqueItems works for any item type and agrees with the schema" {
+    const Point = struct { x: i32, label: ?[]const u8 = null };
+    const T = struct {
+        points: Field([]const Point, .{ .uniqueItems = true }),
+        /// Not unique-checked: must still compile for struct items.
+        others: Field([]const Point, .{ .maxItems = 3 }),
+        nested: Field([]const []const u8, .{ .uniqueItems = true }),
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var v = Validator.init(std.testing.allocator, .{});
+    defer v.deinit();
+    const schema = try v.compile(try toSchema(T, a, .{}));
+    const cases = [_][]const u8{
+        \\{"points": [{"x": 1}, {"x": 2}], "others": [], "nested": ["a", "b"]}
+        ,
+        \\{"points": [{"x": 1}, {"x": 1}], "others": [], "nested": []}
+        ,
+        \\{"points": [{"x": 1, "label": "a"}, {"x": 1, "label": "b"}], "others": [], "nested": []}
+        ,
+        \\{"points": [{"x": 1, "label": null}, {"x": 1}], "others": [], "nested": []}
+        ,
+        \\{"points": [{"x": 1.0}, {"x": 1}], "others": [], "nested": []}
+        ,
+        \\{"points": [], "others": [], "nested": ["a", "a"]}
+        ,
+    };
+    for (cases) |text| {
+        const instance = try std.json.parseFromSliceLeaky(std.json.Value, a, text, .{});
+        const decoded = (try fromJson(T, a, text, .{})).value != null;
+        if (decoded != try schema.isValid(instance)) {
+            std.debug.print("{s}: fromJson {}\n", .{ text, decoded });
+            return error.TestUnexpectedResult;
+        }
+    }
+
+    // `validate` compares the Zig values structurally.
+    const dup = [_]Point{ .{ .x = 1, .label = "a" }, .{ .x = 1, .label = "a" } };
+    var errors: std.ArrayList(ValidationError) = .empty;
+    try validate(T, .{ .points = &dup, .others = &.{}, .nested = &.{} }, a, &errors);
+    try std.testing.expectEqual(@as(usize, 1), errors.items.len);
+    try std.testing.expectEqualStrings("points", errors.items[0].path);
+}
+
 test "field names are converted by field_naming" {
     const cases = .{
         .{ "user_id", "user_id", "userId", "UserId", "user_id", "user-id" },
@@ -2618,15 +2733,19 @@ test "non-exhaustive enums are integer newtypes" {
         \\{"buyer": -1, "seller": 0, "watchers": [1, 1], "referrer": "x"}
     , .{});
     try std.testing.expect(bad.value == null);
+    // uniqueItems is checked on the JSON items while decoding, so it is
+    // reported alongside structural errors.
+    try std.testing.expectEqual(@as(usize, 3), bad.errors.items.len);
     try std.testing.expectEqualStrings("buyer", bad.errors.items[0].path); // does not fit in u32
-    try std.testing.expectEqualStrings("referrer", bad.errors.items[1].path); // not an integer
+    try std.testing.expectEqualStrings("watchers", bad.errors.items[1].path); // uniqueItems
+    try std.testing.expectEqualStrings("referrer", bad.errors.items[2].path); // not an integer
 
     const constraint = try fromJson(Order, a,
         \\{"buyer": 1, "seller": 0, "watchers": [1, 1]}
     , .{});
     try std.testing.expectEqual(@as(usize, 2), constraint.errors.items.len);
-    try std.testing.expectEqualStrings("seller", constraint.errors.items[0].path); // minimum
-    try std.testing.expectEqualStrings("watchers", constraint.errors.items[1].path); // uniqueItems
+    try std.testing.expectEqualStrings("watchers", constraint.errors.items[0].path); // uniqueItems
+    try std.testing.expectEqualStrings("seller", constraint.errors.items[1].path); // minimum
 
     const schema = try toSchema(Order, a, .{});
     const props = schema.object.get("properties").?.object;

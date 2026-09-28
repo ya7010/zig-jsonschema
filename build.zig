@@ -12,7 +12,7 @@ pub fn build(b: *std.Build) void {
 
     const examples_step = b.step("examples", "Build and run every example");
 
-    const example_names = [_][]const u8{ "schema", "validate", "deserialize" };
+    const example_names = [_][]const u8{ "schema", "validate", "deserialize", "objects", "unions", "types", "options", "runtime" };
     for (example_names) |name| {
         const exe = b.addExecutable(.{
             .name = name,
