@@ -1417,3 +1417,67 @@ test "an explicit additionalProperties = false also applies to optional objects"
     try std.testing.expect((try fromJson(Product, a, "{\"billing\": null}")).value != null);
     try std.testing.expect((try fromJson(Product, a, "{\"billing\": {\"zip\": \"1\", \"x\": 1}}")).value == null);
 }
+
+test "an explicit additionalProperties on the root struct overrides unknown_fields" {
+    const Address = struct { zip: []const u8 };
+    const Fields = struct { name: []const u8, address: Address };
+    // Root explicitly open, while the options deny unknown keys elsewhere.
+    const Open = Field(Fields, .{ .additionalProperties = true });
+    // Root explicitly closed, while the options allow unknown keys elsewhere.
+    const Closed = Field(Fields, .{ .additionalProperties = false });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const deny: SchemaOptions = .{ .unknown_fields = .deny };
+    const allow: SchemaOptions = .{ .unknown_fields = .allow };
+
+    const root_extra =
+        \\{"name": "W", "address": {"zip": "1"}, "extra": 1}
+    ;
+    const nested_extra =
+        \\{"name": "W", "address": {"zip": "1", "city": "X"}}
+    ;
+
+    // fromJson: the root follows its explicit setting, the unlabelled
+    // nested struct follows the options.
+    try std.testing.expect((try fromJsonWithOptions(Open, a, root_extra, deny)).value != null);
+    const open_nested = try fromJsonWithOptions(Open, a, nested_extra, deny);
+    try std.testing.expect(open_nested.value == null);
+    try std.testing.expectEqualStrings("address.city", open_nested.errors.items[0].path);
+
+    const closed_root = try fromJsonWithOptions(Closed, a, root_extra, allow);
+    try std.testing.expect(closed_root.value == null);
+    try std.testing.expectEqualStrings("extra", closed_root.errors.items[0].path);
+    try std.testing.expect((try fromJsonWithOptions(Closed, a, nested_extra, allow)).value != null);
+
+    // toSchema emits the same decisions.
+    const open_schema = try toSchemaWithOptions(Open, a, deny);
+    try std.testing.expectEqual(true, open_schema.object.get("additionalProperties").?.bool);
+    const open_address = open_schema.object.get("properties").?.object.get("address").?.object;
+    try std.testing.expectEqual(false, open_address.get("additionalProperties").?.bool);
+
+    const closed_schema = try toSchemaWithOptions(Closed, a, allow);
+    try std.testing.expectEqual(false, closed_schema.object.get("additionalProperties").?.bool);
+    const closed_address = closed_schema.object.get("properties").?.object.get("address").?.object;
+    try std.testing.expect(closed_address.get("additionalProperties") == null);
+
+    // And the runtime validator agrees with fromJson on the generated schemas.
+    var v = Validator.init(std.testing.allocator, .{});
+    defer v.deinit();
+    const cases = [_]struct { schema: std.json.Value, options: SchemaOptions, text: []const u8, open: bool }{
+        .{ .schema = open_schema, .options = deny, .text = root_extra, .open = true },
+        .{ .schema = open_schema, .options = deny, .text = nested_extra, .open = true },
+        .{ .schema = closed_schema, .options = allow, .text = root_extra, .open = false },
+        .{ .schema = closed_schema, .options = allow, .text = nested_extra, .open = false },
+    };
+    for (cases) |c| {
+        const compiled = try v.compile(c.schema);
+        const instance = try std.json.parseFromSliceLeaky(std.json.Value, a, c.text, .{});
+        const via_comptime = if (c.open)
+            (try fromJsonWithOptions(Open, a, c.text, c.options)).value != null
+        else
+            (try fromJsonWithOptions(Closed, a, c.text, c.options)).value != null;
+        try std.testing.expectEqual(via_comptime, try compiled.isValid(instance));
+    }
+}

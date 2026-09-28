@@ -166,3 +166,11 @@ test "unknown_fields_deny: additionalProperties false everywhere unless overridd
         metadata: Field(struct { source: []const u8 }, .{ .additionalProperties = true }),
     }, .{ .unknown_fields = .deny });
 }
+
+test "unknown_fields_deny_open_root: an explicit root setting overrides unknown_fields" {
+    try checkCaseWith("unknown_fields_deny_open_root", Field(struct {
+        name: []const u8,
+        /// Not labelled, so it still follows `unknown_fields = .deny`.
+        address: Address,
+    }, .{ .additionalProperties = true }), .{ .unknown_fields = .deny });
+}
