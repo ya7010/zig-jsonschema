@@ -1,29 +1,29 @@
 //! Example: objects. Nested structs, arrays of structs, optional objects,
 //! object-level constraints, unknown keys, shared `$defs` and recursion.
 const std = @import("std");
-const js = @import("zig-jsonschema");
-const Field = js.Field;
+const js = @import("jsonschema");
+const Schema = js.Schema;
 
 /// A named struct used in several places: emitted once under `$defs` and
 /// referenced with `$ref` (see `reuse_definitions`).
 const Address = struct {
-    street: Field([]const u8, .{ .minLength = 1 }),
+    street: Schema([]const u8, .{ .minLength = 1 }),
     city: []const u8,
-    zip: Field([]const u8, .{ .pattern = "^[0-9]{3}-[0-9]{4}$" }),
+    zip: Schema([]const u8, .{ .pattern = "^[0-9]{3}-[0-9]{4}$" }),
 };
 
 const Customer = struct {
-    name: Field([]const u8, .{ .minLength = 1 }),
+    name: Schema([]const u8, .{ .minLength = 1 }),
     /// A nested object.
     home: Address,
     /// An optional object: may be missing or `null`.
     billing: ?Address,
     /// An array of objects, with array constraints.
-    previous: Field([]const Address, .{ .maxItems = 3 }),
+    previous: Schema([]const Address, .{ .maxItems = 3 }),
     /// Object constraints on a use of a struct. `additionalProperties =
     /// true` accepts (and ignores) keys that are not fields; an anonymous
     /// struct is always inlined.
-    metadata: Field(struct { source: []const u8 }, .{
+    metadata: Schema(struct { source: []const u8 }, .{
         .description = "Free-form metadata",
         .additionalProperties = true,
         .minProperties = 1,
@@ -88,7 +88,7 @@ pub fn main() !void {
     try printErrors("Constraint errors in nested objects", try js.fromJson(Customer, a, invalid, .{}));
 
     // --- Unknown keys: ignored by default, rejected with unknown_fields =
-    // .deny (except where a Field sets additionalProperties explicitly, as
+    // .deny (except where a Schema sets additionalProperties explicitly, as
     // `metadata` does). The schema says the same: additionalProperties false.
     const extra =
         \\{"name": "Ada", "home": {"street": "1", "city": "T", "zip": "100-0001", "floor": 3},
@@ -98,7 +98,7 @@ pub fn main() !void {
     try printErrors("unknown_fields = .deny", try js.fromJson(Customer, a, extra, strict));
     std.debug.print("(accepted with the default options: {})\n", .{(try js.fromJson(Customer, a, extra, .{})).value != null});
 
-    // --- additionalProperties set explicitly on a Field always wins over
+    // --- additionalProperties set explicitly on a Schema always wins over
     // unknown_fields; unset objects follow it. This also works on the root.
     try additionalPropertiesDemo(a);
 
@@ -115,11 +115,11 @@ const Tags = struct { color: []const u8 };
 
 /// The root is open (`additionalProperties: true`) even under
 /// `unknown_fields = .deny`; its unlabelled `unset` object still follows the option.
-const Settings = Field(struct {
+const Settings = Schema(struct {
     /// Extra keys always accepted (and ignored), whatever the options say.
-    open: Field(Tags, .{ .additionalProperties = true }),
+    open: Schema(Tags, .{ .additionalProperties = true }),
     /// Extra keys always rejected, whatever the options say.
-    closed: Field(Tags, .{ .additionalProperties = false }),
+    closed: Schema(Tags, .{ .additionalProperties = false }),
     /// Not set: follows `unknown_fields`.
     unset: Tags,
 }, .{ .additionalProperties = true });

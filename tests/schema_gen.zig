@@ -8,10 +8,10 @@
 //! with `zig build test-schema-gen -Dupdate-snapshots` and review the diff.
 
 const std = @import("std");
-const js = @import("zig-jsonschema");
+const js = @import("jsonschema");
 const options = @import("schema_gen_options");
 
-const Field = js.Field;
+const Schema = js.Schema;
 
 const drafts = [_]struct { name: []const u8, draft: js.Draft }{
     .{ .name = "draft4", .draft = .draft4 },
@@ -21,12 +21,12 @@ const drafts = [_]struct { name: []const u8, draft: js.Draft }{
     .{ .name = "draft2020-12", .draft = .draft2020_12 },
 };
 
-fn checkCase(comptime case_name: []const u8, comptime Schema: type) !void {
-    return checkCaseWith(case_name, Schema, .{});
+fn checkCase(comptime case_name: []const u8, comptime Decl: type) !void {
+    return checkCaseWith(case_name, Decl, .{});
 }
 
 /// `base` supplies every option except `draft`, which is iterated.
-fn checkCaseWith(comptime case_name: []const u8, comptime Schema: type, base: js.SchemaOptions) !void {
+fn checkCaseWith(comptime case_name: []const u8, comptime Decl: type, base: js.SchemaOptions) !void {
     const io = std.testing.io;
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -40,7 +40,7 @@ fn checkCaseWith(comptime case_name: []const u8, comptime Schema: type, base: js
     for (drafts) |d| {
         var opts = base;
         opts.draft = d.draft;
-        const schema = try js.toSchema(Schema, arena, opts);
+        const schema = try js.toSchema(Decl, arena, opts);
         const actual = try std.fmt.allocPrint(arena, "{s}\n", .{
             try std.json.Stringify.valueAlloc(arena, schema, .{ .whitespace = .indent_2 }),
         });
@@ -96,31 +96,31 @@ fn printFirstDifference(expected: []const u8, actual: []const u8) void {
 
 test "product: every constraint kind" {
     try checkCase("product", struct {
-        name: Field([]const u8, .{ .title = "Name", .minLength = 1, .maxLength = 100 }),
-        price: Field(f64, .{
+        name: Schema([]const u8, .{ .title = "Name", .minLength = 1, .maxLength = 100 }),
+        price: Schema(f64, .{
             .title = "Price",
             .description = "Unit price in JPY, must be positive",
             .minimum = 0,
             .exclusiveMinimum = 0,
         }),
-        quantity: Field(u32, .{ .minimum = 0, .maximum = 1000, .default = 1 }),
-        discount: Field(?f64, .{ .minimum = 0, .maximum = 1 }),
-        in_stock: Field(bool, .{ .title = "In stock", .default = true }),
-        tags: Field([]const []const u8, .{ .title = "Tags", .minItems = 1, .maxItems = 5, .uniqueItems = true }),
+        quantity: Schema(u32, .{ .minimum = 0, .maximum = 1000, .default = 1 }),
+        discount: Schema(?f64, .{ .minimum = 0, .maximum = 1 }),
+        in_stock: Schema(bool, .{ .title = "In stock", .default = true }),
+        tags: Schema([]const []const u8, .{ .title = "Tags", .minItems = 1, .maxItems = 5, .uniqueItems = true }),
     });
 }
 
 test "numeric_bounds: inclusive/exclusive combinations and multipleOf" {
     try checkCase("numeric_bounds", struct {
         /// Only exclusive bounds.
-        exclusive_only: Field(f64, .{ .exclusiveMinimum = 0, .exclusiveMaximum = 1 }),
+        exclusive_only: Schema(f64, .{ .exclusiveMinimum = 0, .exclusiveMaximum = 1 }),
         /// Exclusive bound is the stricter one on both sides.
-        exclusive_stricter: Field(f64, .{ .minimum = 0, .exclusiveMinimum = 5, .maximum = 100, .exclusiveMaximum = 50 }),
+        exclusive_stricter: Schema(f64, .{ .minimum = 0, .exclusiveMinimum = 5, .maximum = 100, .exclusiveMaximum = 50 }),
         /// Inclusive bound is the stricter one on both sides.
-        inclusive_stricter: Field(f64, .{ .minimum = 10, .exclusiveMinimum = 5, .maximum = 20, .exclusiveMaximum = 50 }),
+        inclusive_stricter: Schema(f64, .{ .minimum = 10, .exclusiveMinimum = 5, .maximum = 20, .exclusiveMaximum = 50 }),
         /// Equal bounds: the exclusive one wins.
-        equal_bounds: Field(i64, .{ .minimum = 0, .exclusiveMinimum = 0 }),
-        step: Field(f64, .{ .multipleOf = 0.5 }),
+        equal_bounds: Schema(i64, .{ .minimum = 0, .exclusiveMinimum = 0 }),
+        step: Schema(f64, .{ .multipleOf = 0.5 }),
         plain_int: u8,
         plain_float: f32,
     });
@@ -128,8 +128,8 @@ test "numeric_bounds: inclusive/exclusive combinations and multipleOf" {
 
 test "strings: lengths, pattern and default" {
     try checkCase("strings", struct {
-        code: Field([]const u8, .{ .minLength = 3, .maxLength = 3, .pattern = "^[A-Z]{3}$" }),
-        note: Field([]const u8, .{ .description = "Free text", .default = "" }),
+        code: Schema([]const u8, .{ .minLength = 3, .maxLength = 3, .pattern = "^[A-Z]{3}$" }),
+        note: Schema([]const u8, .{ .description = "Free text", .default = "" }),
         label: []const u8,
         nickname: ?[]const u8,
     });
@@ -137,21 +137,21 @@ test "strings: lengths, pattern and default" {
 
 test "arrays: item constraints and nesting" {
     try checkCase("arrays", struct {
-        scores: Field([]const Field(f64, .{ .minimum = 0, .maximum = 100 }), .{ .minItems = 1 }),
+        scores: Schema([]const Schema(f64, .{ .minimum = 0, .maximum = 100 }), .{ .minItems = 1 }),
         matrix: []const []const i32,
-        ids: Field([]const u64, .{ .uniqueItems = true, .maxItems = 10 }),
+        ids: Schema([]const u64, .{ .uniqueItems = true, .maxItems = 10 }),
     });
 }
 
 const Address = struct {
-    street: Field([]const u8, .{ .minLength = 1 }),
-    zip: Field([]const u8, .{ .pattern = "^[0-9]{3}-[0-9]{4}$" }),
+    street: Schema([]const u8, .{ .minLength = 1 }),
+    zip: Schema([]const u8, .{ .pattern = "^[0-9]{3}-[0-9]{4}$" }),
 };
 
-const Customer = Field(struct {
+const Customer = Schema(struct {
     address: Address,
-    previous: Field([]const Address, .{ .maxItems = 3 }),
-    metadata: Field(struct { source: []const u8 }, .{ .additionalProperties = true, .minProperties = 1 }),
+    previous: Schema([]const Address, .{ .maxItems = 3 }),
+    metadata: Schema(struct { source: []const u8 }, .{ .additionalProperties = true, .minProperties = 1 }),
     billing: ?Address,
 }, .{ .title = "Customer", .additionalProperties = false });
 
@@ -169,12 +169,12 @@ test "unknown_fields_deny: additionalProperties false everywhere unless overridd
         previous: []const Address,
         billing: ?Address,
         /// An explicit setting wins over `unknown_fields`.
-        metadata: Field(struct { source: []const u8 }, .{ .additionalProperties = true }),
+        metadata: Schema(struct { source: []const u8 }, .{ .additionalProperties = true }),
     }, .{ .unknown_fields = .deny });
 }
 
 test "unknown_fields_deny_open_root: an explicit root setting overrides unknown_fields" {
-    try checkCaseWith("unknown_fields_deny_open_root", Field(struct {
+    try checkCaseWith("unknown_fields_deny_open_root", Schema(struct {
         name: []const u8,
         /// Not labelled, so it still follows `unknown_fields = .deny`.
         address: Address,
@@ -186,8 +186,8 @@ const UserId = enum(u64) { _ };
 test "newtype_enum: non-exhaustive enums as integer newtypes" {
     try checkCase("newtype_enum", struct {
         id: UserId,
-        owner: Field(UserId, .{ .minimum = 1, .description = "Owner account" }),
-        members: Field([]const UserId, .{ .uniqueItems = true }),
+        owner: Schema(UserId, .{ .minimum = 1, .description = "Owner account" }),
+        members: Schema([]const UserId, .{ .uniqueItems = true }),
         parent: ?UserId,
     });
 }
@@ -204,10 +204,10 @@ const legacy = struct {
 test "shared_definitions: use-site keywords, optional references and name clashes" {
     try checkCase("shared_definitions", struct {
         home: Address,
-        work: Field(Address, .{ .description = "Office address", .minProperties = 1 }),
+        work: Schema(Address, .{ .description = "Office address", .minProperties = 1 }),
         billing: ?Address,
         /// Explicit additionalProperties: inlined instead of referenced.
-        strict: Field(Address, .{ .additionalProperties = false }),
+        strict: Schema(Address, .{ .additionalProperties = false }),
         history: Page(Address),
         legacy: legacy.Address,
     });
@@ -246,14 +246,14 @@ test "with_id: a root $id (id in draft 4) that the $refs resolve against" {
     }, .{ .id = "https://example.com/schemas/order.json" });
 }
 
-const Circle = struct { radius: Field(f64, .{ .exclusiveMinimum = 0 }) };
+const Circle = struct { radius: Schema(f64, .{ .exclusiveMinimum = 0 }) };
 const Rect = struct { width: f64, height: f64 };
 
 /// Externally tagged, as std.json writes unions: `{"circle": {...}}`.
 const Shape = union(enum) {
     circle: Circle,
     rect: Rect,
-    label: Field([]const u8, .{ .minLength = 1 }),
+    label: Schema([]const u8, .{ .minLength = 1 }),
     empty,
 };
 
@@ -268,7 +268,7 @@ const TaggedShape = union(enum) {
 test "unions: external and internal tagging, void variants, optional unions" {
     try checkCase("unions", struct {
         shape: Shape,
-        tagged: Field(TaggedShape, .{ .description = "Tagged by kind" }),
+        tagged: Schema(TaggedShape, .{ .description = "Tagged by kind" }),
         maybe: ?Shape,
     });
 }

@@ -2,16 +2,16 @@
 //! and `fromJson`, so that the published schema accepts exactly what the
 //! program accepts.
 const std = @import("std");
-const js = @import("zig-jsonschema");
-const Field = js.Field;
+const js = @import("jsonschema");
+const Schema = js.Schema;
 
 const Address = struct { postal_code: []const u8, city_name: []const u8 };
 
 const Profile = struct {
-    user_name: Field([]const u8, .{ .minLength = 1 }),
+    user_name: Schema([]const u8, .{ .minLength = 1 }),
     display_name: ?[]const u8,
     home_address: Address,
-    score: Field(f64, .{ .exclusiveMinimum = 0, .maximum = 10 }),
+    score: Schema(f64, .{ .exclusiveMinimum = 0, .maximum = 10 }),
     last_seen: union(enum) { online, offline_since: struct { unix_time: i64 } },
 };
 

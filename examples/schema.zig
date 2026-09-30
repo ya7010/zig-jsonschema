@@ -1,21 +1,21 @@
 //! Example: generating a JSON Schema.
 const std = @import("std");
-const js = @import("zig-jsonschema");
+const js = @import("jsonschema");
 
 /// A declaration style close to pydantic's `Field(gt=0, le=1000)`.
 /// `Product` itself is only a schema "declaration"; it is never constructed.
 const Product = struct {
-    name: js.Field([]const u8, .{ .title = "Name", .minLength = 1, .maxLength = 100 }),
-    price: js.Field(f64, .{
+    name: js.Schema([]const u8, .{ .title = "Name", .minLength = 1, .maxLength = 100 }),
+    price: js.Schema(f64, .{
         .title = "Price",
         .description = "Unit price in JPY, must be positive",
         .minimum = 0,
         .exclusiveMinimum = 0,
     }),
-    quantity: js.Field(u32, .{ .minimum = 0, .maximum = 1000, .default = 1 }),
-    discount: js.Field(?f64, .{ .minimum = 0, .maximum = 1 }),
-    in_stock: js.Field(bool, .{ .title = "In stock", .default = true }),
-    tags: js.Field([]const []const u8, .{
+    quantity: js.Schema(u32, .{ .minimum = 0, .maximum = 1000, .default = 1 }),
+    discount: js.Schema(?f64, .{ .minimum = 0, .maximum = 1 }),
+    in_stock: js.Schema(bool, .{ .title = "In stock", .default = true }),
+    tags: js.Schema([]const []const u8, .{
         .title = "Tags",
         .minItems = 1,
         .maxItems = 5,

@@ -2,17 +2,17 @@
 //!
 //! - Integer types are bounded by their range (`u8` is 0..255), so the
 //!   schema rejects what `fromJson` could not store.
-//! - `Field(T, ...)` is an ordinary type: give it a name to reuse a
+//! - `Schema(T, ...)` is an ordinary type: give it a name to reuse a
 //!   constraint (`Email`, `Percent`).
 //! - A non-exhaustive enum (`enum(u64) { _ }`) is a distinct integer
 //!   newtype: `UserId` and `OrderId` cannot be mixed up in Zig code, but both
 //!   are plain integers in JSON.
 const std = @import("std");
-const js = @import("zig-jsonschema");
-const Field = js.Field;
+const js = @import("jsonschema");
+const Schema = js.Schema;
 
-const Email = Field([]const u8, .{ .pattern = "^[^@\\s]+@[^@\\s]+$", .maxLength = 254 });
-const Percent = Field(f64, .{ .minimum = 0, .maximum = 100 });
+const Email = Schema([]const u8, .{ .pattern = "^[^@\\s]+@[^@\\s]+$", .maxLength = 254 });
+const Percent = Schema(f64, .{ .minimum = 0, .maximum = 100 });
 const UserId = enum(u64) { _ };
 const OrderId = enum(u64) { _ };
 
@@ -24,10 +24,10 @@ const Order = struct {
     cc: ?Email,
     discount: Percent,
     /// `u8`: 0..255 unless a stricter bound is given.
-    quantity: Field(u8, .{ .minimum = 1 }),
+    quantity: Schema(u8, .{ .minimum = 1 }),
     /// A default makes the key optional.
-    priority: Field(i8, .{ .minimum = -5, .maximum = 5, .default = 0 }),
-    note: Field([]const u8, .{ .maxLength = 10, .default = "" }),
+    priority: Schema(i8, .{ .minimum = -5, .maximum = 5, .default = 0 }),
+    note: Schema([]const u8, .{ .maxLength = 10, .default = "" }),
     gift: bool = false,
     weights: []const f32,
 };

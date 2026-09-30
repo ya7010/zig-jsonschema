@@ -6,10 +6,10 @@
 //!   tagged: `{"kind": "circle", "radius": 1}`. Every variant must then be a
 //!   struct or void.
 const std = @import("std");
-const js = @import("zig-jsonschema");
-const Field = js.Field;
+const js = @import("jsonschema");
+const Schema = js.Schema;
 
-const Circle = struct { radius: Field(f64, .{ .exclusiveMinimum = 0 }) };
+const Circle = struct { radius: Schema(f64, .{ .exclusiveMinimum = 0 }) };
 const Rect = struct { width: f64, height: f64 };
 
 /// Externally tagged.
@@ -17,7 +17,7 @@ const Shape = union(enum) {
     circle: Circle,
     rect: Rect,
     /// Any payload type works, including labelled ones.
-    label: Field([]const u8, .{ .minLength = 1 }),
+    label: Schema([]const u8, .{ .minLength = 1 }),
     none,
 };
 

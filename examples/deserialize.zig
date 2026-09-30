@@ -1,21 +1,21 @@
 //! Example: mapping a JSON string into a "plain" struct (deserialization),
 //! then running validation on the result in the same call.
 const std = @import("std");
-const js = @import("zig-jsonschema");
+const js = @import("jsonschema");
 
 /// `Product` itself is only a schema "declaration"; it is never constructed.
 const Product = struct {
-    name: js.Field([]const u8, .{ .title = "Name", .minLength = 1, .maxLength = 100 }),
-    price: js.Field(f64, .{
+    name: js.Schema([]const u8, .{ .title = "Name", .minLength = 1, .maxLength = 100 }),
+    price: js.Schema(f64, .{
         .title = "Price",
         .description = "Unit price in JPY, must be positive",
         .minimum = 0,
         .exclusiveMinimum = 0,
     }),
-    quantity: js.Field(u32, .{ .minimum = 0, .maximum = 1000, .default = 1 }),
-    discount: js.Field(?f64, .{ .minimum = 0, .maximum = 1 }),
-    in_stock: js.Field(bool, .{ .title = "In stock", .default = true }),
-    tags: js.Field([]const []const u8, .{
+    quantity: js.Schema(u32, .{ .minimum = 0, .maximum = 1000, .default = 1 }),
+    discount: js.Schema(?f64, .{ .minimum = 0, .maximum = 1 }),
+    in_stock: js.Schema(bool, .{ .title = "In stock", .default = true }),
+    tags: js.Schema([]const []const u8, .{
         .title = "Tags",
         .minItems = 1,
         .maxItems = 5,
@@ -40,7 +40,7 @@ pub fn main() !void {
         for (p.tags) |tag| std.debug.print("  tag: {s}\n", .{tag});
     }
 
-    // Omitting quantity falls back to the Field's default (=1)
+    // Omitting quantity falls back to the Schema's default (=1)
     const missing_quantity_json =
         \\{"name": "Widget", "price": 12.5, "tags": ["sale"]}
     ;

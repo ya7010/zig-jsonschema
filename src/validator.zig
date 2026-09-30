@@ -378,7 +378,7 @@ pub const Validator = struct {
         const doc = try a.create(Value);
         doc.* = schema;
         self.anonymous_count += 1;
-        const base = try std.fmt.allocPrint(a, "urn:zig-jsonschema:anonymous:{d}", .{self.anonymous_count});
+        const base = try std.fmt.allocPrint(a, "urn:jsonschema:anonymous:{d}", .{self.anonymous_count});
         const res = try self.compileDocument(base, doc);
         return .{ .validator = self, .root = res.root.? };
     }
