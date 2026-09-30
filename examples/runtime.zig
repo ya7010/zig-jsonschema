@@ -1,7 +1,7 @@
 //! Example: the runtime `Validator`, for any JSON Schema document (drafts 4,
 //! 6, 7, 2019-09 and 2020-12), not only schemas generated from Zig types.
 const std = @import("std");
-const js = @import("zig_jsonschema");
+const js = @import("zig-jsonschema");
 
 pub fn main() !void {
     const gpa = std.heap.page_allocator;

@@ -1,6 +1,6 @@
 //! Example: validating an already-built value.
 const std = @import("std");
-const js = @import("zig_jsonschema");
+const js = @import("zig-jsonschema");
 
 /// `Product` itself is only a schema "declaration"; it is never constructed.
 const Product = struct {

@@ -1,4 +1,6 @@
 .{
+    // The package name must be a bare identifier; the module it exports is
+    // imported as `@import("zig-jsonschema")` (see build.zig).
     .name = .zig_jsonschema,
     .version = "0.0.1",
     .dependencies = .{

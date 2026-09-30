@@ -6,7 +6,7 @@
 //!   tagged: `{"kind": "circle", "radius": 1}`. Every variant must then be a
 //!   struct or void.
 const std = @import("std");
-const js = @import("zig_jsonschema");
+const js = @import("zig-jsonschema");
 const Field = js.Field;
 
 const Circle = struct { radius: Field(f64, .{ .exclusiveMinimum = 0 }) };

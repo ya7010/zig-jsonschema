@@ -2,7 +2,7 @@
 //! and `fromJson`, so that the published schema accepts exactly what the
 //! program accepts.
 const std = @import("std");
-const js = @import("zig_jsonschema");
+const js = @import("zig-jsonschema");
 const Field = js.Field;
 
 const Address = struct { postal_code: []const u8, city_name: []const u8 };

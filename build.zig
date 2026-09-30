@@ -4,7 +4,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const mod = b.addModule("zig_jsonschema", .{
+    const mod = b.addModule("zig-jsonschema", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -21,7 +21,7 @@ pub fn build(b: *std.Build) void {
                 .target = target,
                 .optimize = optimize,
                 .imports = &.{
-                    .{ .name = "zig_jsonschema", .module = mod },
+                    .{ .name = "zig-jsonschema", .module = mod },
                 },
             }),
         });
@@ -53,7 +53,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "zig_jsonschema", .module = mod },
+                .{ .name = "zig-jsonschema", .module = mod },
                 .{ .name = "schema_gen_options", .module = schema_gen_options.createModule() },
             },
         }),
@@ -81,7 +81,7 @@ pub fn build(b: *std.Build) void {
                 .target = target,
                 .optimize = optimize,
                 .imports = &.{
-                    .{ .name = "zig_jsonschema", .module = mod },
+                    .{ .name = "zig-jsonschema", .module = mod },
                     .{ .name = "suite_options", .module = suite_options.createModule() },
                 },
             }),

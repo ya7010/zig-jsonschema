@@ -18,7 +18,7 @@
 //! failing case.
 
 const std = @import("std");
-const js = @import("zig_jsonschema");
+const js = @import("zig-jsonschema");
 const suite_options = @import("suite_options");
 
 const Io = std.Io;

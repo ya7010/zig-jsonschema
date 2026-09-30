@@ -1,7 +1,7 @@
 //! Example: objects. Nested structs, arrays of structs, optional objects,
 //! object-level constraints, unknown keys, shared `$defs` and recursion.
 const std = @import("std");
-const js = @import("zig_jsonschema");
+const js = @import("zig-jsonschema");
 const Field = js.Field;
 
 /// A named struct used in several places: emitted once under `$defs` and

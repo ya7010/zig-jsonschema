@@ -8,7 +8,7 @@
 //!   newtype: `UserId` and `OrderId` cannot be mixed up in Zig code, but both
 //!   are plain integers in JSON.
 const std = @import("std");
-const js = @import("zig_jsonschema");
+const js = @import("zig-jsonschema");
 const Field = js.Field;
 
 const Email = Field([]const u8, .{ .pattern = "^[^@\\s]+@[^@\\s]+$", .maxLength = 254 });

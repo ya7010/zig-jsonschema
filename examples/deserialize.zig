@@ -1,7 +1,7 @@
 //! Example: mapping a JSON string into a "plain" struct (deserialization),
 //! then running validation on the result in the same call.
 const std = @import("std");
-const js = @import("zig_jsonschema");
+const js = @import("zig-jsonschema");
 
 /// `Product` itself is only a schema "declaration"; it is never constructed.
 const Product = struct {

@@ -1,6 +1,6 @@
 //! Example: generating a JSON Schema.
 const std = @import("std");
-const js = @import("zig_jsonschema");
+const js = @import("zig-jsonschema");
 
 /// A declaration style close to pydantic's `Field(gt=0, le=1000)`.
 /// `Product` itself is only a schema "declaration"; it is never constructed.

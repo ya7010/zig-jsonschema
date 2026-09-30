@@ -8,7 +8,7 @@
 //! with `zig build test-schema-gen -Dupdate-snapshots` and review the diff.
 
 const std = @import("std");
-const js = @import("zig_jsonschema");
+const js = @import("zig-jsonschema");
 const options = @import("schema_gen_options");
 
 const Field = js.Field;
