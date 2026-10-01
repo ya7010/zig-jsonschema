@@ -1,0 +1,40 @@
+{
+  "$schema": "http://json-schema.org/draft-04/schema#",
+  "type": "object",
+  "properties": {
+    "primary": {
+      "$ref": "#/definitions/Color"
+    },
+    "accent": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Color"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "background": {
+      "$ref": "#/definitions/Gradient"
+    }
+  },
+  "required": [
+    "primary",
+    "background"
+  ],
+  "definitions": {
+    "Color": {
+      "type": "string",
+      "pattern": "^#[0-9a-f]{6}$"
+    },
+    "Gradient": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "items": {
+        "$ref": "#/definitions/Color"
+      }
+    }
+  }
+}

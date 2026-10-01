@@ -273,6 +273,19 @@ test "unions: external and internal tagging, void variants, optional unions" {
     });
 }
 
+test "unions_if_then: internally tagged unions as if/then (oneOf before draft 7)" {
+    try checkCaseWith("unions_if_then", struct {
+        tagged: TaggedShape,
+        inline_tagged: union(enum) {
+            pub const json_discriminator = "type";
+            on: struct { level: u8 },
+            off,
+        },
+        /// Not internally tagged: unchanged.
+        shape: Shape,
+    }, .{ .union_encoding = .if_then });
+}
+
 /// Untagged: the bare payload, `5` or `"five"`.
 const Id = union(enum) {
     pub const json_untagged = true;
@@ -331,5 +344,48 @@ test "extra: keywords merged next to the generated ones" {
         work: Schema(PostalAddress, .{ .description = "Work address", .extra =
             \\{"dependentRequired": {"zip": ["city"]}}
         }),
+    });
+}
+
+/// `"#rrggbb"`, with its own schema.
+const Color = struct {
+    r: u8,
+    g: u8,
+    b: u8,
+
+    pub fn jsonSchema(gen: *js.SchemaGen) std.mem.Allocator.Error!std.json.Value {
+        return gen.parse(
+            \\{"type": "string", "pattern": "^#[0-9a-f]{6}$"}
+        );
+    }
+
+    pub fn jsonParseFromValue(_: std.mem.Allocator, _: std.json.Value, _: std.json.ParseOptions) !Color {
+        unreachable; // generation only
+    }
+};
+
+/// Embeds the schema of another type.
+const Gradient = struct {
+    from: Color,
+    to: Color,
+
+    pub fn jsonSchema(gen: *js.SchemaGen) std.mem.Allocator.Error!std.json.Value {
+        var schema = try gen.parse(
+            \\{"type": "array", "minItems": 2, "maxItems": 2}
+        );
+        try schema.object.put(gen.allocator(), "items", try gen.schemaFor(Color));
+        return schema;
+    }
+
+    pub fn jsonParseFromValue(_: std.mem.Allocator, _: std.json.Value, _: std.json.ParseOptions) !Gradient {
+        unreachable; // generation only
+    }
+};
+
+test "custom_schema: types with their own jsonSchema, shared, embedded and optional" {
+    try checkCase("custom_schema", struct {
+        primary: Color,
+        accent: ?Color,
+        background: Gradient,
     });
 }

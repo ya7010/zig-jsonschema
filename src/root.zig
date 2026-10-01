@@ -178,6 +178,7 @@ fn ConstraintsFor(comptime T: type) type {
     if (comptime isSchema(Inner)) {
         @compileError("jsonschema: nesting Schema() inside another Schema() is not supported");
     }
+    if (comptime hasCustomSchema(Inner)) return CustomConstraints;
     return switch (@typeInfo(Inner)) {
         .int, .float => NumberConstraints,
         .@"enum" => blk: {
@@ -198,6 +199,25 @@ fn ConstraintsFor(comptime T: type) type {
         },
         else => @compileError("jsonschema: unsupported Schema inner type " ++ @typeName(T)),
     };
+}
+
+/// A type with its own `jsonSchema` (see `SchemaGen`) cannot be labelled.
+const CustomConstraints = struct {};
+
+/// Whether `T` declares `pub fn jsonSchema` (see `SchemaGen`), which also
+/// requires `pub fn jsonParseFromValue`.
+fn hasCustomSchema(comptime T: type) bool {
+    switch (@typeInfo(T)) {
+        .@"struct", .@"union", .@"enum" => {},
+        else => return false,
+    }
+    if (isSchema(T) or !@hasDecl(T, "jsonSchema")) return false;
+    if (!std.meta.hasFn(T, "jsonParseFromValue")) {
+        @compileError("jsonschema: " ++ @typeName(T) ++ " declares jsonSchema, so it must also declare " ++
+            "`pub fn jsonParseFromValue(allocator, source: std.json.Value, options: std.json.ParseOptions) !@This()` " ++
+            "to decode what its schema accepts");
+    }
+    return true;
 }
 
 fn requireTaggedUnion(comptime T: type) void {
@@ -230,6 +250,8 @@ fn discriminatorOf(comptime T: type) ?[]const u8 {
         switch (@typeInfo(Payload)) {
             .void => {},
             .@"struct" => {
+                if (hasCustomSchema(Payload)) @compileError("jsonschema: variant '" ++ f.name ++ "' of internally tagged union " ++
+                    @typeName(T) ++ " cannot have a custom jsonSchema (its fields sit next to the discriminator)");
                 if (@hasField(Payload, key)) @compileError("jsonschema: variant '" ++ f.name ++ "' of " ++
                     @typeName(T) ++ " has a field named like the discriminator '" ++ key ++ "'");
                 // Its keywords would sit next to the discriminator, which
@@ -257,7 +279,8 @@ fn generatedKeywords(comptime C: type) []const []const u8 {
         ArrayConstraints => &.{ "items", "minItems", "maxItems", "uniqueItems" },
         ObjectConstraints => &.{ "properties", "required", "additionalProperties", "minProperties", "maxProperties" },
         // An optional union is `anyOf: [<union>, null]`.
-        UnionConstraints => &.{ "oneOf", "anyOf" },
+        // `.if_then` writes an object with `allOf`.
+        UnionConstraints => &.{ "oneOf", "anyOf", "allOf", "properties", "required" },
         else => unreachable,
     };
     return &common ++ own;
@@ -283,6 +306,17 @@ fn extraKeys(comptime C: type, comptime text: []const u8) []const []const u8 {
     }
 }
 
+/// Checks at comptime that `text` is one JSON value.
+fn checkJson(comptime text: []const u8) void {
+    comptime {
+        var p: ComptimeJson = .{ .s = text };
+        if (!std.unicode.utf8ValidateSlice(text)) p.fail("invalid UTF-8");
+        p.value();
+        p.ws();
+        if (p.i != text.len) p.fail("unexpected trailing characters");
+    }
+}
+
 /// A comptime JSON reader, as strict as `std.json` (which parses `.extra`
 /// again at runtime): it checks the syntax and collects an object's keys.
 const ComptimeJson = struct {
@@ -290,7 +324,7 @@ const ComptimeJson = struct {
     i: usize = 0,
 
     fn fail(p: *const ComptimeJson, comptime msg: []const u8) noreturn {
-        @compileError(std.fmt.comptimePrint("jsonschema: invalid .extra JSON at byte {d}: {s}", .{ p.i, msg }));
+        @compileError(std.fmt.comptimePrint("jsonschema: invalid JSON at byte {d}: {s}", .{ p.i, msg }));
     }
 
     fn peek(p: *const ComptimeJson) ?u8 {
@@ -502,6 +536,10 @@ fn requireOpenEnum(comptime T: type) void {
 ///   this value alone, where a reference would not resolve as it does in
 ///   the full document.
 pub fn Schema(comptime T: type, comptime constraints: ConstraintsFor(T)) type {
+    if (comptime ConstraintsFor(T) == CustomConstraints) {
+        @compileError("jsonschema: " ++ @typeName(T) ++ " has its own jsonSchema and cannot be labelled with Schema(); " ++
+            "put the keywords in its jsonSchema");
+    }
     if (constraints.extra) |text| _ = extraKeys(@TypeOf(constraints), text);
     return struct {
         pub const zjs_is_schema = true;
@@ -528,6 +566,8 @@ pub fn Unwrap(comptime Decl: type) type {
     // Walking nested and recursive types takes more than the default quota.
     @setEvalBranchQuota(100_000);
     if (comptime isSchema(Decl)) return Unwrap(Decl.zjs_inner);
+    // Decoded by its own `jsonParseFromValue`.
+    if (comptime hasCustomSchema(Decl)) return Decl;
 
     return switch (@typeInfo(Decl)) {
         .int, .float, .bool, .void => Decl,
@@ -576,6 +616,8 @@ fn unwrapUnion(comptime Decl: type) type {
 
 /// Types `T` refers to that `Unwrap` descends into.
 fn containedTypes(comptime T: type) []const type {
+    // Opaque to this library: its own jsonSchema / jsonParseFromValue handle it.
+    if (hasCustomSchema(T)) return &.{};
     return switch (@typeInfo(T)) {
         .optional => |o| &.{o.child},
         .pointer => |p| if ((p.size == .slice and p.child != u8) or p.size == .one) &.{p.child} else &.{},
@@ -596,12 +638,14 @@ fn containedTypes(comptime T: type) []const type {
     };
 }
 
-/// Whether `T` contains a `Schema()` label with `.extra` anywhere.
-fn hasExtra(comptime T: type, comptime visiting: []const type) bool {
+/// Whether `T` contains, anywhere, a `Schema()` label with `.extra` or a
+/// type with its own `jsonSchema`: what only JSON can be checked against.
+fn needsJson(comptime T: type, comptime visiting: []const type) bool {
     @setEvalBranchQuota(100_000);
     if (isSchema(T) and T.zjs_constraints.extra != null) return true;
+    if (hasCustomSchema(T)) return true;
     for (visiting) |v| if (v == T) return false;
-    for (containedTypes(T)) |C| if (hasExtra(C, visiting ++ &[_]type{T})) return true;
+    for (containedTypes(T)) |C| if (needsJson(C, visiting ++ &[_]type{T})) return true;
     return false;
 }
 
@@ -727,6 +771,21 @@ pub const SchemaOptions = struct {
     /// instead of inlining it at each use. Recursive types are always
     /// emitted this way. Generation only.
     reuse_definitions: bool = true,
+    /// How internally tagged unions (`json_discriminator`) are written.
+    /// Both accept the same documents; they differ in the errors other
+    /// validators report. Generation only.
+    union_encoding: UnionEncoding = .one_of,
+};
+
+pub const UnionEncoding = enum {
+    /// `oneOf` with one branch per variant. A validator tries every branch,
+    /// so an invalid value gets the errors of every variant.
+    one_of,
+    /// `allOf` of `if: {<discriminator> is "<variant>"}, then: <variant>`,
+    /// so a validator reports only the errors of the variant the
+    /// discriminator names (or that the discriminator itself is invalid).
+    /// Drafts 4 and 6, which have no `if` / `then`, get `one_of`.
+    if_then,
 };
 
 pub const UnknownFields = enum {
@@ -836,6 +895,71 @@ pub fn toSchema(comptime Decl: type, allocator: Allocator, options: SchemaOption
     return .{ .object = obj };
 }
 
+/// Writes the schema of a type that declares its own, which replaces the
+/// one this library would derive from it:
+///
+/// ```zig
+/// /// `"#rrggbb"` in JSON.
+/// const Color = struct {
+///     r: u8, g: u8, b: u8,
+///
+///     pub fn jsonSchema(gen: *js.SchemaGen) std.mem.Allocator.Error!std.json.Value {
+///         return gen.parse(
+///             \{"type": "string", "pattern": "^#[0-9a-f]{6}$"}
+///         );
+///     }
+///
+///     pub fn jsonParseFromValue(_: std.mem.Allocator, source: std.json.Value, _: std.json.ParseOptions) !Color {
+///         const s = source.string; // the schema guarantees the shape
+///         return .{
+///             .r = try std.fmt.parseInt(u8, s[1..3], 16),
+///             .g = try std.fmt.parseInt(u8, s[3..5], 16),
+///             .b = try std.fmt.parseInt(u8, s[5..7], 16),
+///         };
+///     }
+/// };
+/// ```
+///
+/// - `pub fn jsonParseFromValue`, std.json's decoding hook, is required:
+///   only the type knows how to decode what its schema accepts.
+///   `fromJson` validates the JSON against `jsonSchema` with the runtime
+///   `Validator` first, so `jsonParseFromValue` only sees accepted values
+///   (and should succeed on all of them, for `toSchema` and `fromJson` to
+///   accept the same documents).
+/// - The type is used as is (it is not `Unwrap`ped) and cannot be
+///   labelled with `Schema()`. `validate` rejects it at comptime, as it has
+///   no JSON to check.
+/// - A named type's schema is shared through `$defs` like a struct's, so
+///   it can refer to itself or to other types with `schemaFor`.
+pub const SchemaGen = struct {
+    gen: *Gen,
+
+    /// Owns every value of the generated schema.
+    pub fn allocator(self: *const SchemaGen) Allocator {
+        return self.gen.allocator;
+    }
+
+    /// The options of this generation (such as the `draft` to write).
+    pub fn options(self: *const SchemaGen) SchemaOptions {
+        return self.gen.options;
+    }
+
+    /// The schema of `T` as this library generates it (a `$ref` for a
+    /// shared definition), to embed in this schema.
+    pub fn schemaFor(self: *SchemaGen, comptime T: type) Allocator.Error!std.json.Value {
+        return buildSchema(T, self.gen);
+    }
+
+    /// `text`, a JSON value checked at comptime, as a `std.json.Value`.
+    pub fn parse(self: *const SchemaGen, comptime text: []const u8) Allocator.Error!std.json.Value {
+        comptime checkJson(text);
+        return std.json.parseFromSliceLeaky(std.json.Value, self.gen.allocator, text, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => unreachable,
+        };
+    }
+};
+
 /// State of one schema generation: the shared definitions emitted so far.
 const Gen = struct {
     allocator: Allocator,
@@ -871,7 +995,7 @@ const Gen = struct {
         try gen.refs.put(gen.allocator, type_name, ref);
         // Reserve the slot so definitions keep their order of first use.
         try gen.defs.put(gen.allocator, name, .null);
-        const schema = switch (@typeInfo(T)) {
+        const schema = if (comptime hasCustomSchema(T)) try callCustomSchema(T, gen) else switch (@typeInfo(T)) {
             .@"struct" => try buildObjectSchema(T, .{}, null, gen),
             .@"union" => try buildUnionSchema(T, .{}, gen),
             else => unreachable,
@@ -893,13 +1017,23 @@ const Gen = struct {
     }
 };
 
-/// Whether the root of `Decl` (below `Schema()` and `?`) is a struct or union.
+/// Whether the root of `Decl` (below `Schema()` and `?`) is a struct or
+/// union, or a type with its own `jsonSchema`, which the root inlines.
 fn rootIsStruct(comptime Decl: type) bool {
     if (isSchema(Decl)) return rootIsStruct(Decl.zjs_inner);
+    if (hasCustomSchema(Decl)) return true;
     return switch (@typeInfo(Decl)) {
         .optional => |o| rootIsStruct(o.child),
         .@"struct", .@"union" => true,
         else => false,
+    };
+}
+
+/// Whether `T` is a struct, union or enum with a user-given name.
+fn isNamedType(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .@"enum" => std.mem.indexOf(u8, @typeName(T), "__enum_") == null,
+        else => isNamedStruct(T),
     };
 }
 
@@ -970,18 +1104,23 @@ fn buildSchemaFor(comptime T: type, constraints: ConstraintsFor(T), gen: *Gen) A
     const allocator = gen.allocator;
     if (comptime @typeInfo(T) == .optional) {
         // `?T` accepts `null` (as `fromJson` does).
-        var schema = try buildSchemaFor(@typeInfo(T).optional.child, constraints, gen);
-        if (schema.object.get("type")) |t| {
-            // Widen `type` to `[<type>, "null"]`. The other keywords only
-            // constrain their own instance type, so they keep applying to
-            // non-null values unchanged.
-            var types: std.json.Array = .init(allocator);
-            try types.append(t);
-            try types.append(.{ .string = "null" });
-            try schema.object.put(allocator, "type", .{ .array = types });
-            return schema;
+        const Child = @typeInfo(T).optional.child;
+        var schema = try buildSchemaFor(Child, constraints, gen);
+        // A custom schema's other keywords (`enum`, `not`, ...) may reject
+        // null, so it is never widened.
+        if (comptime !hasCustomSchema(Child)) {
+            if (schema.object.get("type")) |t| {
+                // Widen `type` to `[<type>, "null"]`. The other keywords only
+                // constrain their own instance type, so they keep applying to
+                // non-null values unchanged.
+                var types: std.json.Array = .init(allocator);
+                try types.append(t);
+                try types.append(.{ .string = "null" });
+                try schema.object.put(allocator, "type", .{ .array = types });
+                return schema;
+            }
         }
-        // A reference: `$ref` cannot be widened in place.
+        // A reference (`$ref` cannot be widened in place), or a custom schema.
         var null_schema: std.json.ObjectMap = .empty;
         try null_schema.put(allocator, "type", .{ .string = "null" });
         var branches: std.json.Array = .init(allocator);
@@ -991,6 +1130,7 @@ fn buildSchemaFor(comptime T: type, constraints: ConstraintsFor(T), gen: *Gen) A
         try obj.put(allocator, "anyOf", .{ .array = branches });
         return .{ .object = obj };
     }
+    if (comptime hasCustomSchema(T)) return buildCustomUse(T, gen);
     switch (@typeInfo(T)) {
         .int, .float => return buildNumberSchema(T, constraints, gen),
         .@"enum" => |e| return buildNumberSchema(e.tag_type, constraints, gen),
@@ -1008,6 +1148,37 @@ fn buildSchemaFor(comptime T: type, constraints: ConstraintsFor(T), gen: *Gen) A
         .@"union" => return buildUnionUse(T, constraints, gen),
         else => @compileError("jsonschema: unsupported type " ++ @typeName(T)),
     }
+}
+
+/// Schema for one use of `T`, which has its own `jsonSchema`: a `$ref` to
+/// its shared definition, or its schema inlined (as for structs).
+fn buildCustomUse(comptime T: type, gen: *Gen) Allocator.Error!std.json.Value {
+    if (gen.inline_next_struct) {
+        gen.inline_next_struct = false;
+        return buildInlineCustom(T, gen);
+    }
+    if (comptime !isNamedType(T)) return callCustomSchema(T, gen);
+    const ref = (try gen.refFor(T)) orelse return buildInlineCustom(T, gen);
+    return refWithSiblings(ref, null, null, gen.allocator);
+}
+
+fn buildInlineCustom(comptime T: type, gen: *Gen) Allocator.Error!std.json.Value {
+    try gen.inlining.put(gen.allocator, @typeName(T), {});
+    defer _ = gen.inlining.remove(@typeName(T));
+    return callCustomSchema(T, gen);
+}
+
+fn callCustomSchema(comptime T: type, gen: *Gen) Allocator.Error!std.json.Value {
+    var schema_gen: SchemaGen = .{ .gen = gen };
+    const schema = try T.jsonSchema(&schema_gen);
+    // The rest of the generator works on objects: `true` is `{}`, and
+    // `false` is `{"not": {}}`.
+    if (schema == .bool) {
+        var obj: std.json.ObjectMap = .empty;
+        if (!schema.bool) try obj.put(gen.allocator, "not", .{ .object = .empty });
+        return .{ .object = obj };
+    }
+    return schema;
 }
 
 /// Schema for one use of struct `T`: a `$ref` to its shared definition
@@ -1081,7 +1252,8 @@ fn buildInlineUnion(comptime T: type, constraints: UnionConstraints, gen: *Gen) 
 }
 
 /// `oneOf` with one branch per variant, or `anyOf` of the bare payloads for
-/// an untagged union (see `UnionConstraints`).
+/// an untagged union (see `UnionConstraints`). An internally tagged union
+/// can be written with `if` / `then` instead (see `UnionEncoding`).
 fn buildUnionSchema(comptime T: type, constraints: UnionConstraints, gen: *Gen) Allocator.Error!std.json.Value {
     const allocator = gen.allocator;
     const discriminator = comptime discriminatorOf(T);
@@ -1127,9 +1299,55 @@ fn buildUnionSchema(comptime T: type, constraints: UnionConstraints, gen: *Gen) 
     var obj: std.json.ObjectMap = .empty;
     if (constraints.title) |v| try obj.put(allocator, "title", .{ .string = v });
     if (constraints.description) |v| try obj.put(allocator, "description", .{ .string = v });
+    if (discriminator) |key| {
+        const has_if = switch (gen.options.draft) {
+            .draft4, .draft6 => false,
+            .draft7, .draft2019_09, .draft2020_12 => true,
+        };
+        if (gen.options.union_encoding == .if_then and has_if) {
+            try putIfThenBranches(T, key, &obj, branches, gen);
+            return .{ .object = obj };
+        }
+    }
     // Several untagged branches may match the same value.
     try obj.put(allocator, if (untagged) "anyOf" else "oneOf", .{ .array = branches });
     return .{ .object = obj };
+}
+
+/// `branches` (the `oneOf` branches of internally tagged union `T`) as
+/// `allOf: [{if: {<key> is "<variant>"}, then: <branch>}, ...]`, next to a
+/// check of the discriminator itself. Each branch also requires its own
+/// discriminator value, so this accepts exactly what the `oneOf` does.
+fn putIfThenBranches(comptime T: type, key: []const u8, obj: *std.json.ObjectMap, branches: std.json.Array, gen: *Gen) Allocator.Error!void {
+    const allocator = gen.allocator;
+    var names: std.json.Array = .init(allocator);
+    inline for (@typeInfo(T).@"union".fields) |f| try names.append(.{ .string = jsonName(f.name, gen.options.field_naming) });
+    var key_schema: std.json.ObjectMap = .empty;
+    try key_schema.put(allocator, "enum", .{ .array = names });
+    var props: std.json.ObjectMap = .empty;
+    try props.put(allocator, key, .{ .object = key_schema });
+    var required: std.json.Array = .init(allocator);
+    try required.append(.{ .string = key });
+
+    var all_of: std.json.Array = .init(allocator);
+    for (names.items, branches.items) |name, branch| {
+        var tag: std.json.ObjectMap = .empty;
+        try tag.put(allocator, "const", name);
+        var cond_props: std.json.ObjectMap = .empty;
+        try cond_props.put(allocator, key, .{ .object = tag });
+        var cond: std.json.ObjectMap = .empty;
+        try cond.put(allocator, "properties", .{ .object = cond_props });
+        // Without it, a missing discriminator would match every `if`.
+        try cond.put(allocator, "required", .{ .array = required });
+        var item: std.json.ObjectMap = .empty;
+        try item.put(allocator, "if", .{ .object = cond });
+        try item.put(allocator, "then", branch);
+        try all_of.append(.{ .object = item });
+    }
+    try obj.put(allocator, "type", .{ .string = "object" });
+    try obj.put(allocator, "required", .{ .array = required });
+    try obj.put(allocator, "properties", .{ .object = props });
+    try obj.put(allocator, "allOf", .{ .array = all_of });
 }
 
 /// The discriminator property an internally tagged union adds to a variant's object.
@@ -1362,18 +1580,18 @@ pub const ValidationError = struct {
 
 /// Validates `value` (of type `Unwrap(Decl)`) against the constraints
 /// declared on `Decl`. Every violation found is appended to `errors`
-/// (validation does not stop at the first one). Types that use `.extra`
-/// are a compile error: those keywords can only be checked on JSON
-/// (`fromJson`).
+/// (validation does not stop at the first one). Types that use `.extra`,
+/// or a type with its own `jsonSchema`, are a compile error: those
+/// schemas can only be checked on JSON (`fromJson`).
 pub fn validate(
     comptime Decl: type,
     value: Unwrap(Decl),
     allocator: Allocator,
     errors: *std.ArrayList(ValidationError),
 ) Allocator.Error!void {
-    if (comptime hasExtra(Decl, &.{})) {
-        @compileError("jsonschema: validate cannot check the .extra keywords used in " ++ @typeName(Decl) ++
-            " (they apply to JSON, not to Zig values); use fromJson");
+    if (comptime needsJson(Decl, &.{})) {
+        @compileError("jsonschema: validate cannot check " ++ @typeName(Decl) ++ ", which uses .extra or a type with its own" ++
+            " jsonSchema (they apply to JSON, not to Zig values); use fromJson");
     }
     try validatePath(Decl, value, "", .{}, allocator, errors);
 }
@@ -1401,6 +1619,8 @@ fn validatePath(
         try validatePath(Decl.zjs_inner, value, path, check, allocator, errors);
         return;
     }
+    // Checked against its own schema while decoding (`decodeCustom`).
+    if (comptime hasCustomSchema(Decl)) return;
 
     switch (@typeInfo(Decl)) {
         .int, .float, .bool, .@"enum" => {}, // leaf types: constraints (if any) were already applied above
@@ -1732,26 +1952,78 @@ fn checkExtra(
     allocator: Allocator,
     errors: *std.ArrayList(ValidationError),
 ) Allocator.Error!void {
-    const keys = comptime extraKeys(C, text);
     const schema = (try extras.schemaOf(Labelled, options)) orelse
         return addError(errors, allocator, path, ".extra of {s} is not a valid schema", .{@typeName(Labelled)});
+    _ = try reportSchemaErrors(schema, value, path, comptime extraKeys(C, text), extras, allocator, errors);
+}
+
+/// Validates `value` with the runtime `schema`, reporting each failure
+/// whose first keyword is one of `only` (every failure if null) at the
+/// offending location. Returns whether anything was reported.
+fn reportSchemaErrors(
+    schema: CompiledSchema,
+    value: std.json.Value,
+    path: []const u8,
+    only: ?[]const []const u8,
+    extras: *Extras,
+    allocator: Allocator,
+    errors: *std.ArrayList(ValidationError),
+) Allocator.Error!bool {
     var scratch = std.heap.ArenaAllocator.init(extras.gpa);
     defer scratch.deinit();
     const result = schema.validate(scratch.allocator(), value) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => |e| return addError(errors, allocator, path, ".extra could not be evaluated: {s}", .{@errorName(e)}),
+        else => |e| {
+            try addError(errors, allocator, path, "schema could not be evaluated: {s}", .{@errorName(e)});
+            return true;
+        },
     };
+    var reported = false;
     for (result.errors) |e| {
-        var segments = std.mem.splitScalar(u8, e.keyword_location, '/');
-        _ = segments.next(); // before the leading '/'
-        const keyword = segments.next() orelse continue;
-        for (keys) |k| {
-            if (std.mem.eql(u8, k, try unescapePointer(scratch.allocator(), keyword))) {
-                try addError(errors, allocator, try pointerPath(path, e.instance_location, allocator), "{s}", .{e.message});
-                break;
-            }
+        if (only) |keys| {
+            var segments = std.mem.splitScalar(u8, e.keyword_location, '/');
+            _ = segments.next(); // before the leading '/'
+            const keyword = try unescapePointer(scratch.allocator(), segments.next() orelse continue);
+            for (keys) |k| {
+                if (std.mem.eql(u8, k, keyword)) break;
+            } else continue;
         }
+        try addError(errors, allocator, try pointerPath(path, e.instance_location, allocator), "{s}", .{e.message});
+        reported = true;
     }
+    return reported;
+}
+
+/// Decodes a type with its own `jsonSchema`: `value` must match that
+/// schema, and is then handed to the type's `jsonParseFromValue`.
+fn decodeCustom(
+    comptime T: type,
+    value: std.json.Value,
+    path: []const u8,
+    options: SchemaOptions,
+    extras: *Extras,
+    allocator: Allocator,
+    errors: *std.ArrayList(ValidationError),
+) DecodeError!T {
+    const schema = (try extras.schemaOf(T, options)) orelse {
+        try addError(errors, allocator, path, "the jsonSchema of {s} is not a valid schema", .{@typeName(T)});
+        return error.Invalid;
+    };
+    const valid = schema.isValid(value) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => false, // reported below
+    };
+    if (!valid) {
+        if (!try reportSchemaErrors(schema, value, path, null, extras, allocator, errors)) {
+            try addError(errors, allocator, path, "value does not match the jsonSchema of {s}", .{@typeName(T)});
+        }
+        return error.Invalid;
+    }
+    return T.jsonParseFromValue(allocator, value, .{}) catch |err| {
+        if (@as(anyerror, err) == error.OutOfMemory) return error.OutOfMemory;
+        try addError(errors, allocator, path, "{s}.jsonParseFromValue failed: {s}", .{ @typeName(T), @errorName(err) });
+        return error.Invalid;
+    };
 }
 
 /// `path` extended with the JSON Pointer `pointer` (relative to it).
@@ -1792,6 +2064,8 @@ fn decodeValue(
         }
         return decoded;
     }
+
+    if (comptime hasCustomSchema(Decl)) return decodeCustom(Decl, value, path, options, extras, allocator, errors);
 
     switch (@typeInfo(Decl)) {
         .optional => |info| {
@@ -2958,20 +3232,22 @@ test "tagged unions: toSchema and fromJson agree in both representations on ever
 
     inline for (std.meta.fields(Draft)) |f| {
         for ([_]UnknownFields{ .allow, .deny }) |unknown| {
-            for ([_]bool{ true, false }) |reuse| {
-                const options: SchemaOptions = .{ .draft = @enumFromInt(f.value), .unknown_fields = unknown, .reuse_definitions = reuse };
-                var v = Validator.init(std.testing.allocator, .{});
-                defer v.deinit();
-                const generated = try toSchema(T.Drawing, a, options);
-                try std.testing.expect(try v.isValidSchema(generated));
-                const schema = try v.compile(generated);
-                for (cases) |text| {
-                    const decoded = (try fromJson(T.Drawing, a, text, options)).value != null;
-                    const instance = try std.json.parseFromSliceLeaky(std.json.Value, a, text, .{});
-                    const valid = try schema.isValid(instance);
-                    if (decoded != valid) {
-                        std.debug.print("{s} ({s}, {t}, reuse={}): fromJson {}, schema {}\n", .{ text, f.name, unknown, reuse, decoded, valid });
-                        return error.TestUnexpectedResult;
+            for ([_]UnionEncoding{ .one_of, .if_then }) |encoding| {
+                for ([_]bool{ true, false }) |reuse| {
+                    const options: SchemaOptions = .{ .draft = @enumFromInt(f.value), .unknown_fields = unknown, .reuse_definitions = reuse, .union_encoding = encoding };
+                    var v = Validator.init(std.testing.allocator, .{});
+                    defer v.deinit();
+                    const generated = try toSchema(T.Drawing, a, options);
+                    try std.testing.expect(try v.isValidSchema(generated));
+                    const schema = try v.compile(generated);
+                    for (cases) |text| {
+                        const decoded = (try fromJson(T.Drawing, a, text, options)).value != null;
+                        const instance = try std.json.parseFromSliceLeaky(std.json.Value, a, text, .{});
+                        const valid = try schema.isValid(instance);
+                        if (decoded != valid) {
+                            std.debug.print("{s} ({s}, {t}, {t}, reuse={}): fromJson {}, schema {}\n", .{ text, f.name, unknown, encoding, reuse, decoded, valid });
+                            return error.TestUnexpectedResult;
+                        }
                     }
                 }
             }
@@ -3232,6 +3508,215 @@ test "extra: merged into toSchema, enforced by fromJson as the runtime validator
     try std.testing.expectEqual(expected.len, paths.items.len);
     for (expected, paths.items) |want, got| try std.testing.expectEqualStrings(want, got);
     try std.testing.expectEqualStrings("required property \"card_number\" is missing", bad.errors.items[0].message);
+}
+
+const custom_test_types = struct {
+    /// `"#rrggbb"`.
+    const Color = struct {
+        r: u8,
+        g: u8,
+        b: u8,
+
+        pub fn jsonSchema(gen: *SchemaGen) Allocator.Error!std.json.Value {
+            return gen.parse(
+                \\{"type": "string", "pattern": "^#[0-9a-f]{6}$"}
+            );
+        }
+
+        pub fn jsonParseFromValue(_: Allocator, source: std.json.Value, _: std.json.ParseOptions) !Color {
+            const s = source.string;
+            return .{
+                .r = try std.fmt.parseInt(u8, s[1..3], 16),
+                .g = try std.fmt.parseInt(u8, s[3..5], 16),
+                .b = try std.fmt.parseInt(u8, s[5..7], 16),
+            };
+        }
+    };
+    /// An exhaustive enum, as its names.
+    const Level = enum {
+        low,
+        high,
+
+        pub fn jsonSchema(gen: *SchemaGen) Allocator.Error!std.json.Value {
+            return gen.parse(
+                \\{"enum": ["low", "high"]}
+            );
+        }
+
+        pub fn jsonParseFromValue(_: Allocator, source: std.json.Value, _: std.json.ParseOptions) !Level {
+            return std.meta.stringToEnum(Level, source.string).?;
+        }
+    };
+    /// `[<from>, <to>]`, embedding the schema of another type.
+    const Gradient = struct {
+        from: Color,
+        to: Color,
+
+        pub fn jsonSchema(gen: *SchemaGen) Allocator.Error!std.json.Value {
+            var schema = try gen.parse(
+                \\{"type": "array", "minItems": 2, "maxItems": 2}
+            );
+            try schema.object.put(gen.allocator(), "items", try gen.schemaFor(Color));
+            return schema;
+        }
+
+        pub fn jsonParseFromValue(a: Allocator, source: std.json.Value, o: std.json.ParseOptions) !Gradient {
+            const items = source.array.items;
+            return .{ .from = try Color.jsonParseFromValue(a, items[0], o), .to = try Color.jsonParseFromValue(a, items[1], o) };
+        }
+    };
+    const Theme = struct {
+        name: Schema([]const u8, .{ .minLength = 1 }),
+        primary: Color,
+        accent: ?Color,
+        level: Level,
+        fallback_level: ?Level,
+        palette: []const Color,
+        background: Gradient,
+        /// Custom variants of an untagged union.
+        mark: union(enum) {
+            pub const json_untagged = true;
+            color: Color,
+            level: Level,
+        },
+    };
+};
+
+test "custom jsonSchema: toSchema and fromJson agree on every draft" {
+    const T = custom_test_types;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const rest =
+        \\"level": "low", "fallback_level": null, "palette": ["#000000"], "background": ["#000000", "#ffffff"], "mark": "high"
+    ;
+    const cases = [_][]const u8{
+        "{\"name\": \"t\", \"primary\": \"#ff8800\", \"accent\": null, " ++ rest ++ "}",
+        "{\"name\": \"t\", \"primary\": \"#FF8800\", \"accent\": null, " ++ rest ++ "}",
+        "{\"name\": \"t\", \"primary\": \"ff8800\", \"accent\": \"#123456\", " ++ rest ++ "}",
+        "{\"name\": \"t\", \"primary\": 1, \"accent\": \"#123456\", " ++ rest ++ "}",
+        "{\"name\": \"\", \"primary\": \"#ff8800\", \"accent\": \"x\", " ++ rest ++ "}",
+        \\{"name": "t", "primary": "#ff8800", "accent": null, "level": "mid", "fallback_level": "high", "palette": [], "background": ["#000000", "#ffffff"], "mark": "#abcdef"}
+        ,
+        \\{"name": "t", "primary": "#ff8800", "accent": null, "level": "low", "fallback_level": 1, "palette": ["#00000"], "background": ["#000000"], "mark": "high"}
+        ,
+        \\{"name": "t", "primary": "#ff8800", "accent": null, "level": "low", "background": ["#000000", "#ffffff", "#ffffff"], "palette": [], "mark": "mid"}
+        ,
+        \\{"name": "t", "primary": "#ff8800", "level": "low", "palette": [], "background": ["#000000", "#ffffff"], "mark": "low"}
+        ,
+    };
+
+    inline for (std.meta.fields(Draft)) |f| {
+        for ([_]UnknownFields{ .allow, .deny }) |unknown| {
+            for ([_]bool{ true, false }) |reuse| {
+                const options: SchemaOptions = .{ .draft = @enumFromInt(f.value), .unknown_fields = unknown, .reuse_definitions = reuse };
+                var v = Validator.init(std.testing.allocator, .{});
+                defer v.deinit();
+                const generated = try toSchema(T.Theme, a, options);
+                try std.testing.expect(try v.isValidSchema(generated));
+                const schema = try v.compile(generated);
+                for (cases) |text| {
+                    const result = try fromJson(T.Theme, a, text, options);
+                    const instance = try std.json.parseFromSliceLeaky(std.json.Value, a, text, .{});
+                    const valid = try schema.isValid(instance);
+                    if ((result.value != null) != valid) {
+                        std.debug.print("{s} ({s}, {t}, reuse={}): fromJson {}, schema {}\n", .{ text, f.name, unknown, reuse, result.value != null, valid });
+                        for (result.errors.items) |e| std.debug.print("  {s}: {s}\n", .{ e.path, e.message });
+                        return error.TestUnexpectedResult;
+                    }
+                }
+            }
+        }
+    }
+
+    // Named custom types are shared through $defs; optional ones are
+    // wrapped in anyOf rather than widened.
+    const generated = try toSchema(T.Theme, a, .{});
+    const defs = generated.object.get("$defs").?.object;
+    try std.testing.expectEqualStrings("^#[0-9a-f]{6}$", defs.get("Color").?.object.get("pattern").?.string);
+    try std.testing.expectEqualStrings("#/$defs/Color", defs.get("Gradient").?.object.get("items").?.object.get("$ref").?.string);
+    const props = generated.object.get("properties").?.object;
+    try std.testing.expectEqualStrings("#/$defs/Color", props.get("primary").?.object.get("$ref").?.string);
+    try std.testing.expect(props.get("fallback_level").?.object.get("anyOf") != null);
+
+    const theme = (try fromJson(T.Theme, a,
+        \\{"name": "t", "primary": "#ff8800", "accent": null, "level": "high", "fallback_level": null, "palette": [], "background": ["#000000", "#0000ff"], "mark": "#010203"}
+    , .{})).value.?;
+    try std.testing.expectEqual(@as(u8, 0x88), theme.primary.g);
+    try std.testing.expectEqual(T.Level.high, theme.level);
+    try std.testing.expectEqual(@as(u8, 0xff), theme.background.to.b);
+    try std.testing.expectEqual(@as(u8, 3), theme.mark.color.b);
+
+    // The schema's errors, at the offending location.
+    const bad = try fromJson(T.Theme, a,
+        \\{"name": "t", "primary": "#FF8800", "accent": null, "level": "low", "fallback_level": null, "palette": [], "background": ["#000000", "x"], "mark": "low"}
+    , .{});
+    try std.testing.expectEqual(@as(usize, 2), bad.errors.items.len);
+    try std.testing.expectEqualStrings("primary", bad.errors.items[0].path);
+    try std.testing.expectEqualStrings("background.1", bad.errors.items[1].path);
+}
+
+test "custom jsonSchema: a failing jsonParseFromValue is reported" {
+    const Even = struct {
+        n: u32,
+
+        pub fn jsonSchema(gen: *SchemaGen) Allocator.Error!std.json.Value {
+            return gen.parse("{\"type\": \"integer\"}");
+        }
+
+        pub fn jsonParseFromValue(_: Allocator, source: std.json.Value, _: std.json.ParseOptions) !@This() {
+            if (@mod(source.integer, 2) != 0) return error.Odd;
+            return .{ .n = @intCast(source.integer) };
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqual(@as(u32, 4), (try fromJson(struct { x: Even }, a, "{\"x\": 4}", .{})).value.?.x.n);
+    const bad = try fromJson(struct { x: Even }, a, "{\"x\": 3}", .{});
+    try std.testing.expectEqual(@as(usize, 1), bad.errors.items.len);
+    try std.testing.expectEqualStrings("x", bad.errors.items[0].path);
+    try std.testing.expect(std.mem.endsWith(u8, bad.errors.items[0].message, ".jsonParseFromValue failed: Odd"));
+}
+
+test "union_encoding if_then: other validators report only the named variant's errors" {
+    const T = union_test_types;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const Errors = struct {
+        fn of(encoding: UnionEncoding, text: []const u8, alloc: Allocator) ![]const validator.Error {
+            var v = Validator.init(std.testing.allocator, .{});
+            defer v.deinit();
+            const schema = try v.compile(try toSchema(T.TaggedShape, alloc, .{ .union_encoding = encoding }));
+            return (try schema.validate(alloc, try std.json.parseFromSliceLeaky(std.json.Value, alloc, text, .{}))).errors;
+        }
+    };
+
+    // oneOf can only say that no variant matched (other validators list
+    // every variant's errors); if_then names the circle's own error.
+    const radius = "{\"kind\": \"circle\", \"radius\": 0}";
+    const vague = try Errors.of(.one_of, radius, a);
+    try std.testing.expectEqual(@as(usize, 1), vague.len);
+    try std.testing.expectEqualStrings("/oneOf", vague[0].keyword_location);
+    const narrowed = try Errors.of(.if_then, radius, a);
+    try std.testing.expectEqual(@as(usize, 1), narrowed.len);
+    try std.testing.expectEqualStrings("/radius", narrowed[0].instance_location);
+    try std.testing.expectEqualStrings("/allOf/0/then/properties/radius/exclusiveMinimum", narrowed[0].keyword_location);
+
+    // An unknown or missing discriminator: that error only.
+    for ([_][]const u8{ "{\"kind\": \"triangle\"}", "{\"radius\": 1}" }) |text| {
+        const errors = try Errors.of(.if_then, text, a);
+        try std.testing.expectEqual(@as(usize, 1), errors.len);
+    }
+
+    // Drafts without if/then keep oneOf.
+    for ([_]Draft{ .draft4, .draft6 }) |d| {
+        const schema = try toSchema(T.TaggedShape, a, .{ .draft = d, .union_encoding = .if_then });
+        try std.testing.expect(schema.object.get("oneOf") != null);
+    }
 }
 
 test "recursive unions are shared through definitions" {

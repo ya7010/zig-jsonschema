@@ -1,0 +1,194 @@
+{
+  "$schema": "http://json-schema.org/draft-04/schema#",
+  "type": "object",
+  "properties": {
+    "tagged": {
+      "$ref": "#/definitions/TaggedShape"
+    },
+    "inline_tagged": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "enum": [
+                "on"
+              ]
+            },
+            "level": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 255
+            }
+          },
+          "required": [
+            "type",
+            "level"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "enum": [
+                "off"
+              ]
+            }
+          },
+          "required": [
+            "type"
+          ]
+        }
+      ]
+    },
+    "shape": {
+      "$ref": "#/definitions/Shape"
+    }
+  },
+  "required": [
+    "tagged",
+    "inline_tagged",
+    "shape"
+  ],
+  "definitions": {
+    "TaggedShape": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "enum": [
+                "circle"
+              ]
+            },
+            "radius": {
+              "type": "number",
+              "minimum": 0,
+              "exclusiveMinimum": true
+            }
+          },
+          "required": [
+            "kind",
+            "radius"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "enum": [
+                "rect"
+              ]
+            },
+            "width": {
+              "type": "number"
+            },
+            "height": {
+              "type": "number"
+            }
+          },
+          "required": [
+            "kind",
+            "width",
+            "height"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "enum": [
+                "empty"
+              ]
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "Shape": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "circle": {
+              "$ref": "#/definitions/Circle"
+            }
+          },
+          "required": [
+            "circle"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "rect": {
+              "$ref": "#/definitions/Rect"
+            }
+          },
+          "required": [
+            "rect"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "label": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "label"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "empty": {
+              "type": "object",
+              "maxProperties": 0
+            }
+          },
+          "required": [
+            "empty"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "Circle": {
+      "type": "object",
+      "properties": {
+        "radius": {
+          "type": "number",
+          "minimum": 0,
+          "exclusiveMinimum": true
+        }
+      },
+      "required": [
+        "radius"
+      ]
+    },
+    "Rect": {
+      "type": "object",
+      "properties": {
+        "width": {
+          "type": "number"
+        },
+        "height": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "width",
+        "height"
+      ]
+    }
+  }
+}

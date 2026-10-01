@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2019-09/schema",
+  "type": "object",
+  "properties": {
+    "primary": {
+      "$ref": "#/$defs/Color"
+    },
+    "accent": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Color"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "background": {
+      "$ref": "#/$defs/Gradient"
+    }
+  },
+  "required": [
+    "primary",
+    "background"
+  ],
+  "$defs": {
+    "Color": {
+      "type": "string",
+      "pattern": "^#[0-9a-f]{6}$"
+    },
+    "Gradient": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "items": {
+        "$ref": "#/$defs/Color"
+      }
+    }
+  }
+}

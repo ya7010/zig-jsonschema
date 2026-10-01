@@ -66,7 +66,10 @@ Supported kinds: numbers (bounded by the Zig type's own range, e.g. `u8` is
 either externally or internally tagged, or as `anyOf` when untagged) and integer newtypes
 (non-exhaustive enums). `SchemaOptions` (shared by `toSchema` and
 `fromJson`) picks the draft, how unknown object keys are handled, a root
-`$id`, and the JSON spelling of field names (`camelCase`, `snake_case`, ...).
+`$id`, the JSON spelling of field names (`camelCase`, `snake_case`, ...),
+and whether internally tagged unions are written as `oneOf` or as
+`if` / `then` per variant (`union_encoding`, for clearer errors in other
+validators).
 
 Keywords the constraint fields don't cover (`if` / `then` / `else`, `allOf`,
 `not`, `enum`, ...) go in `.extra`, as JSON text merged into the generated
@@ -83,6 +86,12 @@ const Payment = js.Schema(struct {
     \\ "then": {"required": ["card_number"]}}
 });
 ```
+
+A type whose JSON doesn't follow its layout can write its whole schema
+itself, with `pub fn jsonSchema(gen: *js.SchemaGen)`, together with
+std.json's `pub fn jsonParseFromValue` to decode it. `fromJson` checks the
+JSON against that schema before decoding (see
+[`examples/custom.zig`](examples/custom.zig)).
 
 ## The runtime validator
 

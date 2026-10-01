@@ -1,0 +1,267 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "tagged": {
+      "$ref": "#/$defs/TaggedShape"
+    },
+    "inline_tagged": {
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "enum": [
+            "on",
+            "off"
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "on"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "on"
+              },
+              "level": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 255
+              }
+            },
+            "required": [
+              "type",
+              "level"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "off"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "off"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          }
+        }
+      ]
+    },
+    "shape": {
+      "$ref": "#/$defs/Shape"
+    }
+  },
+  "required": [
+    "tagged",
+    "inline_tagged",
+    "shape"
+  ],
+  "$defs": {
+    "TaggedShape": {
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "circle",
+            "rect",
+            "empty"
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "circle"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "const": "circle"
+              },
+              "radius": {
+                "type": "number",
+                "exclusiveMinimum": 0
+              }
+            },
+            "required": [
+              "kind",
+              "radius"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "rect"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "const": "rect"
+              },
+              "width": {
+                "type": "number"
+              },
+              "height": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "kind",
+              "width",
+              "height"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "empty"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "const": "empty"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          }
+        }
+      ]
+    },
+    "Shape": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "circle": {
+              "$ref": "#/$defs/Circle"
+            }
+          },
+          "required": [
+            "circle"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "rect": {
+              "$ref": "#/$defs/Rect"
+            }
+          },
+          "required": [
+            "rect"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "label": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "label"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "empty": {
+              "type": "object",
+              "maxProperties": 0
+            }
+          },
+          "required": [
+            "empty"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "Circle": {
+      "type": "object",
+      "properties": {
+        "radius": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        }
+      },
+      "required": [
+        "radius"
+      ]
+    },
+    "Rect": {
+      "type": "object",
+      "properties": {
+        "width": {
+          "type": "number"
+        },
+        "height": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "width",
+        "height"
+      ]
+    }
+  }
+}

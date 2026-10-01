@@ -5,7 +5,9 @@
 //!   `{"circle": {"radius": 1}}` (a void variant is `{"none": {}}`).
 //! - `pub const json_discriminator = "kind";` makes a union internally
 //!   tagged: `{"kind": "circle", "radius": 1}`. Every variant must then be a
-//!   struct or void.
+//!   struct or void. `SchemaOptions.union_encoding = .if_then` writes it
+//!   as `if` / `then` per variant rather than `oneOf`, so that other
+//!   validators report only the errors of the variant the tag names.
 //! - `pub const json_untagged = true;` writes the bare payload: `5` or
 //!   `"five"`. The schema is an `anyOf`, and `fromJson` takes the first
 //!   variant (in declaration order) that accepts the value.
@@ -54,6 +56,9 @@ pub fn main() !void {
 
     try printJson(a, "Shape (externally tagged)", try js.toSchema(Shape, a, .{}));
     try printJson(a, "Event (internally tagged by \"type\")", try js.toSchema(Event, a, .{}));
+    // The same union as if/then: other validators then report only the
+    // errors of the variant "type" names, instead of every variant's.
+    try printJson(a, "Event with union_encoding = .if_then", try js.toSchema(Event, a, .{ .union_encoding = .if_then }));
 
     // --- Decoding gives a plain Zig union to switch on.
     const shapes = [_][]const u8{
