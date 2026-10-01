@@ -6,7 +6,8 @@
 //!
 //! Supported kinds: number (int/float, bounded by the type's range), string,
 //! boolean, array (Zig slice), object (Zig struct), tagged union
-//! (`union(enum)`, as `oneOf`), integer newtype (non-exhaustive enum) and
+//! (`union(enum)`, as `oneOf`, or as `anyOf` when `json_untagged`), integer
+//! newtype (non-exhaustive enum) and
 //! single-item pointer (transparent), each with its own constraint set.
 //! `SchemaOptions` picks the draft, unknown-key handling and JSON key
 //! spelling (`field_naming`), shared by `toSchema` and `fromJson` so that
@@ -79,6 +80,8 @@ pub const NumberConstraints = struct {
     exclusiveMinimum: ?f64 = null,
     exclusiveMaximum: ?f64 = null,
     multipleOf: ?f64 = null,
+    /// Extra JSON Schema keywords merged into this schema (see `Schema()`).
+    extra: ?[]const u8 = null,
 };
 
 /// String constraints for JSON Schema (2020-12).
@@ -96,6 +99,8 @@ pub const StringConstraints = struct {
     /// `fromJson` with the same engine as the runtime `Validator`, within
     /// `Regex.default_step_limit` steps.
     pattern: ?[]const u8 = null,
+    /// Extra JSON Schema keywords merged into this schema (see `Schema()`).
+    extra: ?[]const u8 = null,
 };
 
 /// Boolean constraints for JSON Schema (2020-12).
@@ -104,6 +109,8 @@ pub const BoolConstraints = struct {
     description: ?[]const u8 = null,
     /// Default value used when the field is absent from the JSON input.
     default: ?bool = null,
+    /// Extra JSON Schema keywords merged into this schema (see `Schema()`).
+    extra: ?[]const u8 = null,
 };
 
 /// Array constraints for JSON Schema (2020-12). Applies to Zig slices; the
@@ -118,6 +125,8 @@ pub const ArrayConstraints = struct {
     /// `fromJson` compares the JSON items (as JSON Schema does); `validate`
     /// compares the Zig values structurally.
     uniqueItems: ?bool = null,
+    /// Extra JSON Schema keywords merged into this schema (see `Schema()`).
+    extra: ?[]const u8 = null,
 };
 
 /// Object constraints for JSON Schema (2020-12). Applies to Zig structs.
@@ -135,6 +144,8 @@ pub const ObjectConstraints = struct {
     /// `SchemaOptions.unknown_fields` (which allows them by default, like
     /// JSON Schema itself).
     additionalProperties: ?bool = null,
+    /// Extra JSON Schema keywords merged into this schema (see `Schema()`).
+    extra: ?[]const u8 = null,
 };
 
 /// Constraints for a tagged union (`union(enum)`), which maps to a `oneOf`
@@ -143,9 +154,18 @@ pub const ObjectConstraints = struct {
 /// A union that declares `pub const json_discriminator = "kind";` is
 /// written internally tagged instead: `{"kind": "<variant>", ...payload
 /// fields}`, which requires every payload to be a struct or void.
+///
+/// A union that declares `pub const json_untagged = true;` is written as
+/// its bare payload and maps to an `anyOf` instead. `fromJson` picks the
+/// first variant, in declaration order, whose payload decodes and meets its
+/// constraints (as serde's `untagged` does), so a value written from a
+/// later variant may read back as an earlier one that also accepts it.
+/// Every variant needs a payload.
 pub const UnionConstraints = struct {
     title: ?[]const u8 = null,
     description: ?[]const u8 = null,
+    /// Extra JSON Schema keywords merged into this schema (see `Schema()`).
+    extra: ?[]const u8 = null,
 };
 
 /// Selects the constraints type that applies to `T` (or, if `T` is
@@ -186,6 +206,21 @@ fn requireTaggedUnion(comptime T: type) void {
     }
 }
 
+/// Whether union `T` declares `pub const json_untagged = true;`.
+fn isUntagged(comptime T: type) bool {
+    if (!@hasDecl(T, "json_untagged")) return false;
+    const untagged: bool = T.json_untagged;
+    if (!untagged) return false;
+    if (@hasDecl(T, "json_discriminator")) {
+        @compileError("jsonschema: union " ++ @typeName(T) ++ " cannot declare both json_untagged and json_discriminator");
+    }
+    for (@typeInfo(T).@"union".fields) |f| {
+        if (stripSchema(f.type) == void) @compileError("jsonschema: variant '" ++ f.name ++ "' of untagged union " ++
+            @typeName(T) ++ " has no payload; use an optional (`?T`) for a null alternative");
+    }
+    return true;
+}
+
 /// The discriminator key of an internally tagged union, or null.
 fn discriminatorOf(comptime T: type) ?[]const u8 {
     if (!@hasDecl(T, "json_discriminator")) return null;
@@ -194,14 +229,232 @@ fn discriminatorOf(comptime T: type) ?[]const u8 {
         const Payload = stripSchema(f.type);
         switch (@typeInfo(Payload)) {
             .void => {},
-            .@"struct" => if (@hasField(Payload, key)) @compileError("jsonschema: variant '" ++ f.name ++ "' of " ++
-                @typeName(T) ++ " has a field named like the discriminator '" ++ key ++ "'"),
+            .@"struct" => {
+                if (@hasField(Payload, key)) @compileError("jsonschema: variant '" ++ f.name ++ "' of " ++
+                    @typeName(T) ++ " has a field named like the discriminator '" ++ key ++ "'");
+                // Its keywords would sit next to the discriminator, which
+                // `fromJson` strips before decoding the payload.
+                if (isSchema(f.type) and f.type.zjs_constraints.extra != null) @compileError("jsonschema: variant '" ++
+                    f.name ++ "' of internally tagged union " ++ @typeName(T) ++ " cannot have .extra; put it on the union");
+            },
             else => @compileError("jsonschema: variant '" ++ f.name ++ "' of internally tagged union " ++
                 @typeName(T) ++ " must be a struct or void, got " ++ @typeName(Payload)),
         }
     }
     return key;
 }
+
+/// Keywords the generator may emit for a value with constraints `C` (or at
+/// the root), which `.extra` therefore cannot contain. Every kind can be the
+/// root, and a labelled struct or union is always inlined, so no `$ref` /
+/// `allOf` wrapper is ever generated next to `.extra`.
+fn generatedKeywords(comptime C: type) []const []const u8 {
+    const common = [_][]const u8{ "$schema", "$id", "id", "$defs", "definitions", "type", "title", "description", "default" };
+    const own: []const []const u8 = switch (C) {
+        NumberConstraints => &.{ "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf" },
+        StringConstraints => &.{ "minLength", "maxLength", "pattern" },
+        BoolConstraints => &.{},
+        ArrayConstraints => &.{ "items", "minItems", "maxItems", "uniqueItems" },
+        ObjectConstraints => &.{ "properties", "required", "additionalProperties", "minProperties", "maxProperties" },
+        // An optional union is `anyOf: [<union>, null]`.
+        UnionConstraints => &.{ "oneOf", "anyOf" },
+        else => unreachable,
+    };
+    return &common ++ own;
+}
+
+/// The top-level keys of `.extra` text, which must be a JSON object that
+/// does not contain any of the keywords generated for constraints `C`.
+fn extraKeys(comptime C: type, comptime text: []const u8) []const []const u8 {
+    comptime {
+        var p: ComptimeJson = .{ .s = text };
+        if (!std.unicode.utf8ValidateSlice(text)) p.fail("invalid UTF-8");
+        p.ws();
+        if (p.peek() != '{') p.fail("expected a JSON object");
+        const keys = p.object();
+        p.ws();
+        if (p.i != text.len) p.fail("unexpected trailing characters");
+        for (keys) |k| for (generatedKeywords(C)) |g| if (std.mem.eql(u8, k, g)) {
+            @compileError("jsonschema: .extra cannot contain \"" ++ k ++ "\", which the generator emits for this kind of value" ++
+                " (use the constraint field, if there is one)");
+        };
+        const final = keys[0..keys.len].*;
+        return &final;
+    }
+}
+
+/// A comptime JSON reader, as strict as `std.json` (which parses `.extra`
+/// again at runtime): it checks the syntax and collects an object's keys.
+const ComptimeJson = struct {
+    s: []const u8,
+    i: usize = 0,
+
+    fn fail(p: *const ComptimeJson, comptime msg: []const u8) noreturn {
+        @compileError(std.fmt.comptimePrint("jsonschema: invalid .extra JSON at byte {d}: {s}", .{ p.i, msg }));
+    }
+
+    fn peek(p: *const ComptimeJson) ?u8 {
+        return if (p.i < p.s.len) p.s[p.i] else null;
+    }
+
+    fn next(p: *ComptimeJson) u8 {
+        const c = p.peek() orelse p.fail("unexpected end of input");
+        p.i += 1;
+        return c;
+    }
+
+    fn expect(p: *ComptimeJson, comptime c: u8) void {
+        if (p.next() != c) {
+            p.i -= 1;
+            p.fail("expected '" ++ [_]u8{c} ++ "'");
+        }
+    }
+
+    fn ws(p: *ComptimeJson) void {
+        while (p.peek()) |c| switch (c) {
+            ' ', '\t', '\n', '\r' => p.i += 1,
+            else => return,
+        };
+    }
+
+    fn value(p: *ComptimeJson) void {
+        @setEvalBranchQuota(1_000_000);
+        p.ws();
+        switch (p.peek() orelse p.fail("unexpected end of input")) {
+            '{' => _ = p.object(),
+            '[' => p.array(),
+            '"' => _ = p.string(),
+            't' => p.literal("true"),
+            'f' => p.literal("false"),
+            'n' => p.literal("null"),
+            '-', '0'...'9' => p.number(),
+            else => p.fail("expected a JSON value"),
+        }
+    }
+
+    /// The object's keys, in order.
+    fn object(p: *ComptimeJson) []const []const u8 {
+        var keys: []const []const u8 = &.{};
+        p.expect('{');
+        p.ws();
+        if (p.peek() == '}') {
+            p.i += 1;
+            return keys;
+        }
+        while (true) {
+            p.ws();
+            if (p.peek() != '"') p.fail("expected a string key");
+            const key = p.string();
+            for (keys) |k| if (std.mem.eql(u8, k, key)) p.fail("duplicate key \"" ++ key ++ "\"");
+            keys = keys ++ &[_][]const u8{key};
+            p.ws();
+            p.expect(':');
+            p.value();
+            p.ws();
+            if (p.next() == '}') return keys;
+            p.i -= 1;
+            p.expect(',');
+        }
+    }
+
+    fn array(p: *ComptimeJson) void {
+        p.expect('[');
+        p.ws();
+        if (p.peek() == ']') {
+            p.i += 1;
+            return;
+        }
+        while (true) {
+            p.value();
+            p.ws();
+            if (p.next() == ']') return;
+            p.i -= 1;
+            p.expect(',');
+        }
+    }
+
+    /// The decoded string.
+    fn string(p: *ComptimeJson) []const u8 {
+        var out: []const u8 = "";
+        p.expect('"');
+        while (true) {
+            const c = p.next();
+            switch (c) {
+                '"' => return out,
+                0...0x1f => p.fail("control character in string"),
+                '\\' => switch (p.next()) {
+                    '"' => out = out ++ "\"",
+                    '\\' => out = out ++ "\\",
+                    '/' => out = out ++ "/",
+                    'b' => out = out ++ "\x08",
+                    'f' => out = out ++ "\x0c",
+                    'n' => out = out ++ "\n",
+                    'r' => out = out ++ "\r",
+                    't' => out = out ++ "\t",
+                    'u' => {
+                        var cp: u21 = p.hex4();
+                        if (cp >= 0xd800 and cp < 0xdc00) {
+                            p.expect('\\');
+                            p.expect('u');
+                            const low = p.hex4();
+                            if (low < 0xdc00 or low >= 0xe000) p.fail("unpaired surrogate");
+                            cp = 0x10000 + ((cp - 0xd800) << 10) + (low - 0xdc00);
+                        } else if (cp >= 0xdc00 and cp < 0xe000) p.fail("unpaired surrogate");
+                        var buf: [4]u8 = undefined;
+                        const n = std.unicode.utf8Encode(cp, &buf) catch unreachable;
+                        out = out ++ buf[0..n];
+                    },
+                    else => p.fail("invalid escape"),
+                },
+                else => out = out ++ [_]u8{c},
+            }
+        }
+    }
+
+    fn hex4(p: *ComptimeJson) u16 {
+        var v: u16 = 0;
+        for (0..4) |_| v = v * 16 + (std.fmt.charToDigit(p.next(), 16) catch p.fail("invalid \\u escape"));
+        return v;
+    }
+
+    fn literal(p: *ComptimeJson, comptime word: []const u8) void {
+        for (word) |c| if (p.next() != c) p.fail("invalid literal");
+    }
+
+    fn number(p: *ComptimeJson) void {
+        if (p.peek() == '-') p.i += 1;
+        switch (p.next()) {
+            '0' => {},
+            '1'...'9' => p.digits(),
+            else => p.fail("invalid number"),
+        }
+        if (p.peek() == '.') {
+            p.i += 1;
+            p.digit();
+            p.digits();
+        }
+        if (p.peek() == 'e' or p.peek() == 'E') {
+            p.i += 1;
+            if (p.peek() == '+' or p.peek() == '-') p.i += 1;
+            p.digit();
+            p.digits();
+        }
+    }
+
+    fn digit(p: *ComptimeJson) void {
+        switch (p.next()) {
+            '0'...'9' => {},
+            else => p.fail("expected a digit"),
+        }
+    }
+
+    fn digits(p: *ComptimeJson) void {
+        while (p.peek()) |c| switch (c) {
+            '0'...'9' => p.i += 1,
+            else => return,
+        };
+    }
+};
 
 /// `T` below its `Schema()` label, if any.
 fn stripSchema(comptime T: type) type {
@@ -224,7 +477,32 @@ fn requireOpenEnum(comptime T: type) void {
 /// fields; it is never actually constructed. `toSchema`/`validate`/
 /// `fromJson` read `T` and `constraints` through this marker, and callers
 /// always work with the "plain" type produced by `Unwrap()`.
+///
+/// `.extra` takes JSON Schema keywords the constraint fields don't cover,
+/// as the text of a JSON object, merged into the generated schema of this
+/// value as a whole (including `null` for an optional):
+///
+/// ```zig
+/// Schema(struct { method: []const u8, card: ?[]const u8 }, .{ .extra =
+///     \\{"if": {"properties": {"method": {"const": "card"}}},
+///     \\ "then": {"required": ["card"]}}
+/// })
+/// ```
+///
+/// - It is checked at comptime: invalid JSON, or a keyword the generator
+///   emits for this kind of value (such as `type`, or `properties` on a
+///   struct), is a compile error. A labelled struct or union is always
+///   inlined rather than referenced through `$defs`.
+/// - `fromJson` enforces it with the runtime `Validator` (against the
+///   generated schema of this value, so keywords such as
+///   `unevaluatedProperties` see the generated ones), reporting its errors
+///   at the offending location. `validate`, which has no JSON to check,
+///   rejects types that use `.extra` at comptime.
+/// - Don't use `$ref` in it: `fromJson` checks it against the schema of
+///   this value alone, where a reference would not resolve as it does in
+///   the full document.
 pub fn Schema(comptime T: type, comptime constraints: ConstraintsFor(T)) type {
+    if (constraints.extra) |text| _ = extraKeys(@TypeOf(constraints), text);
     return struct {
         pub const zjs_is_schema = true;
         pub const zjs_inner = T;
@@ -316,6 +594,15 @@ fn containedTypes(comptime T: type) []const type {
         },
         else => &.{},
     };
+}
+
+/// Whether `T` contains a `Schema()` label with `.extra` anywhere.
+fn hasExtra(comptime T: type, comptime visiting: []const type) bool {
+    @setEvalBranchQuota(100_000);
+    if (isSchema(T) and T.zjs_constraints.extra != null) return true;
+    for (visiting) |v| if (v == T) return false;
+    for (containedTypes(T)) |C| if (hasExtra(C, visiting ++ &[_]type{T})) return true;
+    return false;
 }
 
 /// Whether `T` contains a `Schema()` label anywhere (cycles are cut off).
@@ -650,15 +937,33 @@ fn shortTypeName(allocator: Allocator, type_name: []const u8) Allocator.Error![]
 
 fn buildSchema(comptime Decl: type, gen: *Gen) Allocator.Error!std.json.Value {
     if (comptime isSchema(Decl)) {
-        return buildSchemaFor(Decl.zjs_inner, Decl.zjs_constraints, gen);
+        return withExtra(try buildSchemaFor(Decl.zjs_inner, Decl.zjs_constraints, gen), Decl.zjs_constraints.extra, gen.allocator);
     }
     // `?Email` where `Email = Schema([]const u8, ...)`: the same as
     // `Schema(?[]const u8, ...)`.
     if (comptime @typeInfo(Decl) == .optional and isSchema(@typeInfo(Decl).optional.child)) {
         const F = @typeInfo(Decl).optional.child;
-        return buildSchemaFor(?F.zjs_inner, F.zjs_constraints, gen);
+        return withExtra(try buildSchemaFor(?F.zjs_inner, F.zjs_constraints, gen), F.zjs_constraints.extra, gen.allocator);
     }
     return buildSchemaFor(Decl, ConstraintsFor(Decl){}, gen);
+}
+
+/// Merges the `.extra` keywords into `schema` (their keys never clash with
+/// generated ones: see `extraKeys`).
+fn withExtra(schema: std.json.Value, comptime extra: ?[]const u8, allocator: Allocator) Allocator.Error!std.json.Value {
+    const text = extra orelse return schema;
+    // Valid JSON, checked at comptime.
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, allocator, text, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => unreachable,
+    };
+    var obj = schema.object;
+    var it = parsed.object.iterator();
+    while (it.next()) |e| {
+        std.debug.assert(!obj.contains(e.key_ptr.*));
+        try obj.put(allocator, e.key_ptr.*, e.value_ptr.*);
+    }
+    return .{ .object = obj };
 }
 
 fn buildSchemaFor(comptime T: type, constraints: ConstraintsFor(T), gen: *Gen) Allocator.Error!std.json.Value {
@@ -716,7 +1021,8 @@ fn buildStructUse(comptime T: type, constraints: ObjectConstraints, gen: *Gen) A
     // An explicit `additionalProperties` changes the object's shape, which a
     // shared definition cannot express, so such uses are inlined.
     if (comptime !isNamedStruct(T)) return buildObjectSchema(T, constraints, null, gen);
-    if (constraints.additionalProperties != null) return buildInlineStruct(T, constraints, gen);
+    // So are uses with `.extra`, which must not sit next to a `$ref`.
+    if (constraints.additionalProperties != null or constraints.extra != null) return buildInlineStruct(T, constraints, gen);
     const ref = (try gen.refFor(T)) orelse return buildInlineStruct(T, constraints, gen);
     var obj = try refWithSiblings(ref, constraints.title, constraints.description, allocator);
     if (obj.object.get("allOf") == null and (constraints.minProperties != null or constraints.maxProperties != null)) {
@@ -762,6 +1068,8 @@ fn buildUnionUse(comptime T: type, constraints: UnionConstraints, gen: *Gen) All
         return buildInlineUnion(T, constraints, gen);
     }
     if (comptime !isNamedStruct(T)) return buildUnionSchema(T, constraints, gen);
+    // `.extra` must not sit next to a `$ref`.
+    if (constraints.extra != null) return buildInlineUnion(T, constraints, gen);
     const ref = (try gen.refFor(T)) orelse return buildInlineUnion(T, constraints, gen);
     return refWithSiblings(ref, constraints.title, constraints.description, gen.allocator);
 }
@@ -772,15 +1080,19 @@ fn buildInlineUnion(comptime T: type, constraints: UnionConstraints, gen: *Gen) 
     return buildUnionSchema(T, constraints, gen);
 }
 
-/// `oneOf` with one branch per variant (see `UnionConstraints`).
+/// `oneOf` with one branch per variant, or `anyOf` of the bare payloads for
+/// an untagged union (see `UnionConstraints`).
 fn buildUnionSchema(comptime T: type, constraints: UnionConstraints, gen: *Gen) Allocator.Error!std.json.Value {
     const allocator = gen.allocator;
     const discriminator = comptime discriminatorOf(T);
+    const untagged = comptime isUntagged(T);
     var branches: std.json.Array = .init(allocator);
     inline for (@typeInfo(T).@"union".fields) |f| {
         const name = jsonName(f.name, gen.options.field_naming);
         const Payload = stripSchema(f.type);
-        if (discriminator) |key| {
+        if (untagged) {
+            try branches.append(try buildSchema(f.type, gen));
+        } else if (discriminator) |key| {
             // `{"<key>": "<name>", ...payload fields}`
             const tag: ObjectTag = .{ .key = key, .value = name };
             if (Payload == void) {
@@ -815,7 +1127,8 @@ fn buildUnionSchema(comptime T: type, constraints: UnionConstraints, gen: *Gen) 
     var obj: std.json.ObjectMap = .empty;
     if (constraints.title) |v| try obj.put(allocator, "title", .{ .string = v });
     if (constraints.description) |v| try obj.put(allocator, "description", .{ .string = v });
-    try obj.put(allocator, "oneOf", .{ .array = branches });
+    // Several untagged branches may match the same value.
+    try obj.put(allocator, if (untagged) "anyOf" else "oneOf", .{ .array = branches });
     return .{ .object = obj };
 }
 
@@ -1049,13 +1362,19 @@ pub const ValidationError = struct {
 
 /// Validates `value` (of type `Unwrap(Decl)`) against the constraints
 /// declared on `Decl`. Every violation found is appended to `errors`
-/// (validation does not stop at the first one).
+/// (validation does not stop at the first one). Types that use `.extra`
+/// are a compile error: those keywords can only be checked on JSON
+/// (`fromJson`).
 pub fn validate(
     comptime Decl: type,
     value: Unwrap(Decl),
     allocator: Allocator,
     errors: *std.ArrayList(ValidationError),
 ) Allocator.Error!void {
+    if (comptime hasExtra(Decl, &.{})) {
+        @compileError("jsonschema: validate cannot check the .extra keywords used in " ++ @typeName(Decl) ++
+            " (they apply to JSON, not to Zig values); use fromJson");
+    }
     try validatePath(Decl, value, "", .{}, allocator, errors);
 }
 
@@ -1105,8 +1424,9 @@ fn validatePath(
         .@"union" => switch (value) {
             inline else => |payload, tag| {
                 const name = @tagName(tag);
-                // Internally tagged payload fields sit next to the tag.
-                const payload_path = if (comptime discriminatorOf(Decl) != null) path else try childPath(path, jsonName(name, check.naming), allocator);
+                // Internally tagged payload fields sit next to the tag, and
+                // an untagged payload is the value itself.
+                const payload_path = if (comptime discriminatorOf(Decl) != null or isUntagged(Decl)) path else try childPath(path, jsonName(name, check.naming), allocator);
                 try validatePath(@FieldType(Decl, name), payload, payload_path, check, allocator, errors);
             },
         },
@@ -1330,13 +1650,15 @@ pub fn fromJson(
     options: SchemaOptions,
 ) Allocator.Error!FromJsonResult(Unwrap(Decl)) {
     var errors: std.ArrayList(ValidationError) = .empty;
+    var extras: Extras = .init(allocator);
+    defer extras.deinit();
 
     const json_value = std.json.parseFromSliceLeaky(std.json.Value, allocator, json_text, .{}) catch |err| {
         try addError(&errors, allocator, "", "invalid JSON: {s}", .{@errorName(err)});
         return .{ .value = null, .errors = errors };
     };
 
-    const decoded: ?Unwrap(Decl) = decodeValue(Decl, json_value, "", null, options, allocator, &errors) catch |err| switch (err) {
+    const decoded: ?Unwrap(Decl) = decodeValue(Decl, json_value, "", null, options, &extras, allocator, &errors) catch |err| switch (err) {
         error.Invalid => null,
         else => |e| return e,
     };
@@ -1350,6 +1672,104 @@ pub fn fromJson(
 
 const DecodeError = error{Invalid} || Allocator.Error;
 
+/// `fromJson`'s runtime `Validator`, which enforces `.extra`, with the
+/// schema of every labelled type checked so far.
+const Extras = struct {
+    gpa: Allocator,
+    /// Holds the generated schemas, which the compiled ones refer to.
+    arena: std.heap.ArenaAllocator,
+    validator: Validator,
+    /// `@typeName` -> compiled schema, or null if it is not a valid schema.
+    compiled: std.StringHashMapUnmanaged(?CompiledSchema) = .empty,
+
+    fn init(gpa: Allocator) Extras {
+        return .{ .gpa = gpa, .arena = .init(gpa), .validator = .init(gpa, .{}) };
+    }
+
+    fn deinit(extras: *Extras) void {
+        extras.compiled.deinit(extras.gpa);
+        extras.validator.deinit();
+        extras.arena.deinit();
+    }
+
+    /// The compiled schema of `Labelled` (a `Schema()` label, or an
+    /// optional one), generated with `options` as the root.
+    fn schemaOf(extras: *Extras, comptime Labelled: type, options: SchemaOptions) Allocator.Error!?CompiledSchema {
+        if (extras.compiled.get(@typeName(Labelled))) |s| return s;
+        var opts = options;
+        opts.id = null;
+        opts.emit_schema_uri = true;
+        const generated = try toSchema(Labelled, extras.arena.allocator(), opts);
+        const valid = extras.validator.isValidSchema(generated) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => false,
+        };
+        const compiled: ?CompiledSchema = if (!valid) null else extras.validator.compile(generated) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => null,
+        };
+        try extras.compiled.put(extras.gpa, @typeName(Labelled), compiled);
+        return compiled;
+    }
+};
+
+/// Checks the JSON `value` of `Labelled` against its `.extra` keywords
+/// `text` (of constraints `C`), with the runtime validator.
+///
+/// The value is validated against the whole generated schema of
+/// `Labelled`, so that the extra keywords see the generated ones next to
+/// them, but only the failures of the extra keywords are reported: the
+/// generated ones are what `fromJson` checks natively (keyword names never
+/// clash, so the first keyword of a failure tells which kind it is).
+fn checkExtra(
+    comptime Labelled: type,
+    comptime C: type,
+    comptime text: []const u8,
+    value: std.json.Value,
+    path: []const u8,
+    options: SchemaOptions,
+    extras: *Extras,
+    allocator: Allocator,
+    errors: *std.ArrayList(ValidationError),
+) Allocator.Error!void {
+    const keys = comptime extraKeys(C, text);
+    const schema = (try extras.schemaOf(Labelled, options)) orelse
+        return addError(errors, allocator, path, ".extra of {s} is not a valid schema", .{@typeName(Labelled)});
+    var scratch = std.heap.ArenaAllocator.init(extras.gpa);
+    defer scratch.deinit();
+    const result = schema.validate(scratch.allocator(), value) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => |e| return addError(errors, allocator, path, ".extra could not be evaluated: {s}", .{@errorName(e)}),
+    };
+    for (result.errors) |e| {
+        var segments = std.mem.splitScalar(u8, e.keyword_location, '/');
+        _ = segments.next(); // before the leading '/'
+        const keyword = segments.next() orelse continue;
+        for (keys) |k| {
+            if (std.mem.eql(u8, k, try unescapePointer(scratch.allocator(), keyword))) {
+                try addError(errors, allocator, try pointerPath(path, e.instance_location, allocator), "{s}", .{e.message});
+                break;
+            }
+        }
+    }
+}
+
+/// `path` extended with the JSON Pointer `pointer` (relative to it).
+fn pointerPath(path: []const u8, pointer: []const u8, allocator: Allocator) Allocator.Error![]const u8 {
+    var out = path;
+    var segments = std.mem.splitScalar(u8, pointer, '/');
+    _ = segments.next();
+    while (segments.next()) |seg| out = try childPath(out, try unescapePointer(allocator, seg), allocator);
+    return out;
+}
+
+/// A JSON Pointer reference token, unescaped (`~1` is `/`, `~0` is `~`).
+fn unescapePointer(allocator: Allocator, token: []const u8) Allocator.Error![]const u8 {
+    if (std.mem.indexOfScalar(u8, token, '~') == null) return token;
+    const slashes = try std.mem.replaceOwned(u8, allocator, token, "~1", "/");
+    return std.mem.replaceOwned(u8, allocator, slashes, "~0", "~");
+}
+
 /// `additional` is the explicit `additionalProperties` of the `Schema()`
 /// labelling this value (if it is an object), or null.
 fn decodeValue(
@@ -1358,13 +1778,15 @@ fn decodeValue(
     path: []const u8,
     additional: ?bool,
     options: SchemaOptions,
+    extras: *Extras,
     allocator: Allocator,
     errors: *std.ArrayList(ValidationError),
 ) DecodeError!Unwrap(Decl) {
     if (comptime isSchema(Decl)) {
         const c = Decl.zjs_constraints;
+        if (c.extra) |text| try checkExtra(Decl, @TypeOf(c), text, value, path, options, extras, allocator, errors);
         const explicit: ?bool = if (comptime @TypeOf(c) == ObjectConstraints) c.additionalProperties else null;
-        const decoded = decodeValue(Decl.zjs_inner, value, path, explicit, options, allocator, errors);
+        const decoded = decodeValue(Decl.zjs_inner, value, path, explicit, options, extras, allocator, errors);
         if (comptime @TypeOf(c) == ArrayConstraints) {
             if ((c.uniqueItems orelse false) and value == .array) try reportDuplicateItems(value.array.items, path, allocator, errors);
         }
@@ -1373,8 +1795,16 @@ fn decodeValue(
 
     switch (@typeInfo(Decl)) {
         .optional => |info| {
-            if (value == .null) return @as(Unwrap(Decl), null);
-            return try decodeValue(info.child, value, path, additional, options, allocator, errors);
+            if (value == .null) {
+                // `?Email`: the `.extra` of `Email` applies to null too
+                // (other values are checked by `Email` itself).
+                if (comptime isSchema(info.child)) {
+                    const c = info.child.zjs_constraints;
+                    if (c.extra) |text| try checkExtra(Decl, @TypeOf(c), text, value, path, options, extras, allocator, errors);
+                }
+                return @as(Unwrap(Decl), null);
+            }
+            return try decodeValue(info.child, value, path, additional, options, extras, allocator, errors);
         },
         .bool => {
             switch (value) {
@@ -1410,7 +1840,7 @@ fn decodeValue(
         .pointer => |info| {
             if (info.size == .one) {
                 const ptr = try allocator.create(Unwrap(info.child));
-                ptr.* = try decodeValue(info.child, value, path, additional, options, allocator, errors);
+                ptr.* = try decodeValue(info.child, value, path, additional, options, extras, allocator, errors);
                 return ptr;
             }
             if (info.size == .slice and info.child == u8) {
@@ -1434,7 +1864,7 @@ fn decodeValue(
 
                 for (items, 0..) |item_value, i| {
                     const idx_path = try childPath(path, try std.fmt.allocPrint(allocator, "{d}", .{i}), allocator);
-                    if (decodeValue(info.child, item_value, idx_path, null, options, allocator, errors)) |decoded| {
+                    if (decodeValue(info.child, item_value, idx_path, null, options, extras, allocator, errors)) |decoded| {
                         buf[i] = decoded;
                     } else |err| switch (err) {
                         error.Invalid => any_failed = true,
@@ -1463,7 +1893,7 @@ fn decodeValue(
                 const name = jsonName(f.name, options.field_naming);
                 const child_path = try childPath(path, name, allocator);
                 if (value.object.get(name)) |sub_value| {
-                    if (decodeValue(f.type, sub_value, child_path, null, options, allocator, errors)) |decoded| {
+                    if (decodeValue(f.type, sub_value, child_path, null, options, extras, allocator, errors)) |decoded| {
                         @field(result, f.name) = decoded;
                     } else |err| switch (err) {
                         error.Invalid => any_failed = true,
@@ -1482,7 +1912,7 @@ fn decodeValue(
             if (any_failed) return error.Invalid;
             return result;
         },
-        .@"union" => return decodeUnion(Decl, value, path, options, allocator, errors),
+        .@"union" => return decodeUnion(Decl, value, path, options, extras, allocator, errors),
         .void => {
             if (value != .object or value.object.count() != 0) {
                 try addError(errors, allocator, path, "expected an empty object", .{});
@@ -1498,10 +1928,12 @@ fn decodeUnion(
     value: std.json.Value,
     path: []const u8,
     options: SchemaOptions,
+    extras: *Extras,
     allocator: Allocator,
     errors: *std.ArrayList(ValidationError),
 ) DecodeError!Unwrap(Decl) {
     const fields = @typeInfo(Decl).@"union".fields;
+    if (comptime isUntagged(Decl)) return decodeUntagged(Decl, value, path, options, extras, allocator, errors);
     if (value != .object) {
         try addError(errors, allocator, path, "expected an object, got {s}", .{@tagName(value)});
         return error.Invalid;
@@ -1529,7 +1961,7 @@ fn decodeUnion(
                     }
                     return @unionInit(Unwrap(Decl), f.name, {});
                 }
-                return @unionInit(Unwrap(Decl), f.name, try decodeValue(f.type, .{ .object = rest }, path, null, options, allocator, errors));
+                return @unionInit(Unwrap(Decl), f.name, try decodeValue(f.type, .{ .object = rest }, path, null, options, extras, allocator, errors));
             }
         }
         try addError(errors, allocator, tag_path, "unknown variant \"{s}\"", .{tag_value.string});
@@ -1545,10 +1977,43 @@ fn decodeUnion(
         const name = jsonName(f.name, options.field_naming);
         if (std.mem.eql(u8, name, key)) {
             const payload_path = try childPath(path, name, allocator);
-            return @unionInit(Unwrap(Decl), f.name, try decodeValue(f.type, value.object.values()[0], payload_path, null, options, allocator, errors));
+            return @unionInit(Unwrap(Decl), f.name, try decodeValue(f.type, value.object.values()[0], payload_path, null, options, extras, allocator, errors));
         }
     }
     try addError(errors, allocator, try childPath(path, key, allocator), "unknown variant", .{});
+    return error.Invalid;
+}
+
+/// The first variant whose payload decodes and meets its constraints, which
+/// is what the generated `anyOf` accepts. If none does, every variant's
+/// errors are reported, prefixed with its name.
+fn decodeUntagged(
+    comptime Decl: type,
+    value: std.json.Value,
+    path: []const u8,
+    options: SchemaOptions,
+    extras: *Extras,
+    allocator: Allocator,
+    errors: *std.ArrayList(ValidationError),
+) DecodeError!Unwrap(Decl) {
+    const fields = @typeInfo(Decl).@"union".fields;
+    var attempts: [fields.len]std.ArrayList(ValidationError) = @splat(.empty);
+    inline for (fields, 0..) |f, i| {
+        const attempt = &attempts[i];
+        if (decodeValue(f.type, value, path, null, options, extras, allocator, attempt)) |payload| {
+            try validatePath(f.type, payload, path, .{ .naming = options.field_naming, .unique_items = false }, allocator, attempt);
+            if (attempt.items.len == 0) return @unionInit(Unwrap(Decl), f.name, payload);
+        } else |err| switch (err) {
+            error.Invalid => {},
+            else => |e| return e,
+        }
+    }
+    try addError(errors, allocator, path, "matches no variant of {s}", .{@typeName(Decl)});
+    inline for (fields, 0..) |f, i| {
+        for (attempts[i].items) |e| {
+            try addError(errors, allocator, e.path, "variant '{s}': {s}", .{ jsonName(f.name, options.field_naming), e.message });
+        }
+    }
     return error.Invalid;
 }
 
@@ -2527,6 +2992,246 @@ test "tagged unions: toSchema and fromJson agree in both representations on ever
     try std.testing.expectEqual(@as(usize, 2), bad.errors.items.len);
     try std.testing.expectEqualStrings("shape.circle.radius", bad.errors.items[0].path);
     try std.testing.expectEqualStrings("tagged.radius", bad.errors.items[1].path);
+}
+
+const untagged_test_types = struct {
+    /// `5` or `"five"`.
+    const Id = union(enum) {
+        pub const json_untagged = true;
+        num: u32,
+        str: Schema([]const u8, .{ .minLength = 1 }),
+    };
+    /// Overlapping variants: the first that accepts a value wins.
+    const Limit = union(enum) {
+        pub const json_untagged = true;
+        small: Schema(u8, .{ .maximum = 10 }),
+        big: u64,
+        many: []const Id,
+        range: struct { min: u32, max: u32 },
+    };
+    const Request = struct {
+        id: Id,
+        limit: Limit,
+        parent: ?Id,
+    };
+};
+
+test "untagged unions: toSchema (anyOf) and fromJson agree on every draft" {
+    const T = untagged_test_types;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cases = [_][]const u8{
+        \\{"id": 5, "limit": 1}
+        ,
+        \\{"id": "five", "limit": 11}
+        ,
+        \\{"id": "", "limit": 1}
+        ,
+        \\{"id": -1, "limit": 1}
+        ,
+        \\{"id": 1.5, "limit": 1}
+        ,
+        \\{"id": true, "limit": 1}
+        ,
+        \\{"id": {"num": 5}, "limit": 1}
+        ,
+        \\{"id": 1, "limit": [1, "x", 2]}
+        ,
+        \\{"id": 1, "limit": [1, ""]}
+        ,
+        \\{"id": 1, "limit": {"min": 1, "max": 2}}
+        ,
+        \\{"id": 1, "limit": {"min": 1}}
+        ,
+        \\{"id": 1, "limit": -3}
+        ,
+        \\{"id": 1, "limit": 1, "parent": null}
+        ,
+        \\{"id": 1, "limit": 1, "parent": "p"}
+        ,
+        \\{"id": 1, "limit": 1, "parent": false}
+        ,
+    };
+
+    inline for (std.meta.fields(Draft)) |f| {
+        for ([_]UnknownFields{ .allow, .deny }) |unknown| {
+            for ([_]bool{ true, false }) |reuse| {
+                const options: SchemaOptions = .{ .draft = @enumFromInt(f.value), .unknown_fields = unknown, .reuse_definitions = reuse };
+                var v = Validator.init(std.testing.allocator, .{});
+                defer v.deinit();
+                const generated = try toSchema(T.Request, a, options);
+                try std.testing.expect(try v.isValidSchema(generated));
+                const schema = try v.compile(generated);
+                for (cases) |text| {
+                    const decoded = (try fromJson(T.Request, a, text, options)).value != null;
+                    const instance = try std.json.parseFromSliceLeaky(std.json.Value, a, text, .{});
+                    const valid = try schema.isValid(instance);
+                    if (decoded != valid) {
+                        std.debug.print("{s} ({s}, {t}, reuse={}): fromJson {}, schema {}\n", .{ text, f.name, unknown, reuse, decoded, valid });
+                        return error.TestUnexpectedResult;
+                    }
+                }
+            }
+        }
+    }
+
+    const generated = try toSchema(T.Request, a, .{});
+    const id_def = generated.object.get("$defs").?.object.get("Id").?.object;
+    try std.testing.expectEqual(@as(usize, 2), id_def.get("anyOf").?.array.items.len);
+    try std.testing.expect(id_def.get("oneOf") == null);
+
+    // Declaration order decides between overlapping variants.
+    const small = (try fromJson(T.Request, a, "{\"id\": \"x\", \"limit\": 3}", .{})).value.?;
+    try std.testing.expectEqualStrings("x", small.id.str);
+    try std.testing.expectEqual(@as(u8, 3), small.limit.small);
+    const big = (try fromJson(T.Request, a, "{\"id\": 7, \"limit\": 300}", .{})).value.?;
+    try std.testing.expectEqual(@as(u32, 7), big.id.num);
+    try std.testing.expectEqual(@as(u64, 300), big.limit.big);
+    const many = (try fromJson(T.Request, a, "{\"id\": 7, \"limit\": [1, \"a\"]}", .{})).value.?;
+    try std.testing.expectEqualStrings("a", many.limit.many[1].str);
+
+    // No variant matches: each variant's errors, at the value's own path.
+    const bad = try fromJson(T.Request, a, "{\"id\": \"\", \"limit\": 1}", .{});
+    try std.testing.expectEqual(@as(usize, 3), bad.errors.items.len);
+    try std.testing.expectEqualStrings("id", bad.errors.items[0].path);
+    try std.testing.expectEqualStrings("variant 'num': expected an integer, got string", bad.errors.items[1].message);
+    try std.testing.expectEqualStrings("variant 'str': string length 0 is less than minLength 1", bad.errors.items[2].message);
+
+    // `validate` checks the active variant, at the value's own path.
+    var errors: std.ArrayList(ValidationError) = .empty;
+    try validate(T.Request, .{ .id = .{ .str = "" }, .limit = .{ .small = 20 }, .parent = null }, a, &errors);
+    try std.testing.expectEqual(@as(usize, 2), errors.items.len);
+    try std.testing.expectEqualStrings("id", errors.items[0].path);
+    try std.testing.expectEqualStrings("limit", errors.items[1].path);
+}
+
+const extra_test_types = struct {
+    const Address = struct { city: []const u8, zip: ?[]const u8 };
+    const Payment = Schema(struct {
+        method: []const u8,
+        card_number: ?[]const u8,
+        bank_account: ?[]const u8,
+    }, .{ .extra =
+        \\{
+        \\  "allOf": [
+        \\    {"if": {"properties": {"method": {"const": "card"}}},
+        \\     "then": {"required": ["card_number"], "properties": {"card_number": {"type": "string"}}}},
+        \\    {"if": {"properties": {"method": {"const": "bank"}}},
+        \\     "then": {"required": ["bank_account"]}}
+        \\  ]
+        \\}
+    });
+    const Code = Schema([]const u8, .{ .minLength = 2, .extra =
+        \\{"enum": ["jp", "us", "zz"], "not": {"const": "zz"}}
+    });
+    const Order = struct {
+        payment: Payment,
+        country: Code,
+        /// `?Code`: the extra keywords apply to null too, which `enum` rejects.
+        fallback: ?Code,
+        /// A named struct with `.extra` is inlined.
+        ship_to: Schema(Address, .{ .extra =
+            \\{"dependentRequired": {"zip": ["city"]}, "propertyNames": {"maxLength": 4}}
+        }),
+        tags: Schema([]const []const u8, .{ .extra =
+            \\{"contains": {"const": "gift"}}
+        }),
+        id: Schema(untagged_test_types.Id, .{ .extra =
+            \\{"not": {"const": 0}}
+        }),
+    };
+};
+
+test "extra: merged into toSchema, enforced by fromJson as the runtime validator does on every draft" {
+    const T = extra_test_types;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const rest =
+        \\"country": "jp", "fallback": "us", "ship_to": {"city": "X"}, "tags": ["gift"], "id": 1
+    ;
+    const cases = [_][]const u8{
+        "{\"payment\": {\"method\": \"card\", \"card_number\": \"4111\"}, " ++ rest ++ "}",
+        "{\"payment\": {\"method\": \"card\"}, " ++ rest ++ "}",
+        "{\"payment\": {\"method\": \"card\", \"card_number\": null}, " ++ rest ++ "}",
+        "{\"payment\": {\"method\": \"bank\", \"bank_account\": \"1\"}, " ++ rest ++ "}",
+        "{\"payment\": {\"method\": \"bank\", \"card_number\": \"1\"}, " ++ rest ++ "}",
+        "{\"payment\": {\"method\": \"cash\"}, " ++ rest ++ "}",
+        "{\"payment\": {\"method\": 1}, " ++ rest ++ "}",
+        \\{"payment": {"method": "cash"}, "country": "zz", "fallback": "us", "ship_to": {"city": "X"}, "tags": ["gift"], "id": 1}
+        ,
+        \\{"payment": {"method": "cash"}, "country": "fr", "fallback": "us", "ship_to": {"city": "X"}, "tags": ["gift"], "id": 1}
+        ,
+        \\{"payment": {"method": "cash"}, "country": "j", "fallback": "us", "ship_to": {"city": "X"}, "tags": ["gift"], "id": 1}
+        ,
+        \\{"payment": {"method": "cash"}, "country": "jp", "fallback": null, "ship_to": {"city": "X"}, "tags": ["gift"], "id": 1}
+        ,
+        \\{"payment": {"method": "cash"}, "country": "jp", "ship_to": {"city": "X"}, "tags": ["gift"], "id": 1}
+        ,
+        \\{"payment": {"method": "cash"}, "country": "jp", "fallback": "us", "ship_to": {"city": "X", "zip": "1"}, "tags": ["gift"], "id": 1}
+        ,
+        \\{"payment": {"method": "cash"}, "country": "jp", "fallback": "us", "ship_to": {"city": "X", "extra": 1}, "tags": ["gift"], "id": 1}
+        ,
+        \\{"payment": {"method": "cash"}, "country": "jp", "fallback": "us", "ship_to": {"city": "X"}, "tags": ["a"], "id": 1}
+        ,
+        \\{"payment": {"method": "cash"}, "country": "jp", "fallback": "us", "ship_to": {"city": "X"}, "tags": ["gift"], "id": 0}
+        ,
+        \\{"payment": {"method": "cash"}, "country": "jp", "fallback": "us", "ship_to": {"city": "X"}, "tags": ["gift"], "id": "a"}
+        ,
+    };
+
+    inline for (std.meta.fields(Draft)) |f| {
+        for ([_]UnknownFields{ .allow, .deny }) |unknown| {
+            for ([_]bool{ true, false }) |reuse| {
+                const options: SchemaOptions = .{ .draft = @enumFromInt(f.value), .unknown_fields = unknown, .reuse_definitions = reuse };
+                var v = Validator.init(std.testing.allocator, .{});
+                defer v.deinit();
+                const generated = try toSchema(T.Order, a, options);
+                try std.testing.expect(try v.isValidSchema(generated));
+                const schema = try v.compile(generated);
+                for (cases) |text| {
+                    const result = try fromJson(T.Order, a, text, options);
+                    const instance = try std.json.parseFromSliceLeaky(std.json.Value, a, text, .{});
+                    const valid = try schema.isValid(instance);
+                    if ((result.value != null) != valid) {
+                        std.debug.print("{s} ({s}, {t}, reuse={}): fromJson {}, schema {}\n", .{ text, f.name, unknown, reuse, result.value != null, valid });
+                        for (result.errors.items) |e| std.debug.print("  {s}: {s}\n", .{ e.path, e.message });
+                        return error.TestUnexpectedResult;
+                    }
+                }
+            }
+        }
+    }
+
+    // The extra keywords sit next to the generated ones; the named struct
+    // with `.extra` is inlined rather than referenced.
+    const generated = try toSchema(T.Order, a, .{});
+    const props = generated.object.get("properties").?.object;
+    const payment = props.get("payment").?.object;
+    try std.testing.expectEqualStrings("object", payment.get("type").?.string);
+    try std.testing.expectEqual(@as(usize, 2), payment.get("allOf").?.array.items.len);
+    const fallback = props.get("fallback").?.object;
+    try std.testing.expectEqual(@as(usize, 2), fallback.get("type").?.array.items.len);
+    try std.testing.expect(fallback.get("enum") != null);
+    const ship_to = props.get("ship_to").?.object;
+    try std.testing.expect(ship_to.get("$ref") == null);
+    try std.testing.expect(ship_to.get("dependentRequired") != null);
+
+    // Only the extra keywords' failures come from the validator, at the
+    // offending location; the generated ones are reported natively, once.
+    const bad = try fromJson(T.Order, a,
+        \\{"payment": {"method": "card"}, "country": "j", "fallback": null, "ship_to": {"city": "X", "extra": 1}, "tags": [], "id": 0}
+    , .{});
+    var paths: std.ArrayList([]const u8) = .empty;
+    for (bad.errors.items) |e| try paths.append(a, e.path);
+    // (Native constraint errors such as minLength come after decoding.)
+    const expected = [_][]const u8{ "payment", "country", "fallback", "ship_to", "tags", "id", "country" };
+    try std.testing.expectEqual(expected.len, paths.items.len);
+    for (expected, paths.items) |want, got| try std.testing.expectEqualStrings(want, got);
+    try std.testing.expectEqualStrings("required property \"card_number\" is missing", bad.errors.items[0].message);
 }
 
 test "recursive unions are shared through definitions" {

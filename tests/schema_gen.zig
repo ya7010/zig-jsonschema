@@ -273,6 +273,26 @@ test "unions: external and internal tagging, void variants, optional unions" {
     });
 }
 
+/// Untagged: the bare payload, `5` or `"five"`.
+const Id = union(enum) {
+    pub const json_untagged = true;
+    num: u32,
+    str: Schema([]const u8, .{ .minLength = 1 }),
+};
+
+test "untagged_unions: anyOf of the bare payloads, shared and inline" {
+    try checkCase("untagged_unions", struct {
+        id: Schema(Id, .{ .description = "Numeric or textual id" }),
+        parent: ?Id,
+        value: union(enum) {
+            pub const json_untagged = true;
+            flag: bool,
+            ids: []const Id,
+            point: struct { x: f64, y: f64 },
+        },
+    });
+}
+
 const Expr = union(enum) {
     num: f64,
     add: []const Expr,
@@ -290,4 +310,26 @@ test "field_naming: camelCase keys for fields and union variants" {
         home_address: Address,
         last_event: union(enum) { signed_in: struct { at_time: i64 }, signed_out },
     }, .{ .field_naming = .camel_case });
+}
+
+const PostalAddress = struct { city: []const u8, zip: ?[]const u8 };
+
+test "extra: keywords merged next to the generated ones" {
+    try checkCase("extra", struct {
+        payment: Schema(struct {
+            method: []const u8,
+            card_number: ?[]const u8,
+        }, .{ .extra =
+            \\{"if": {"properties": {"method": {"const": "card"}}},
+            \\ "then": {"required": ["card_number"]}}
+        }),
+        country: ?Schema([]const u8, .{ .minLength = 2, .extra =
+            \\{"enum": ["jp", "us", null]}
+        }),
+        home: PostalAddress,
+        /// The same named struct with `.extra` is inlined.
+        work: Schema(PostalAddress, .{ .description = "Work address", .extra =
+            \\{"dependentRequired": {"zip": ["city"]}}
+        }),
+    });
 }

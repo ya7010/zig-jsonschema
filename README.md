@@ -63,10 +63,26 @@ value you actually read and write is the "plain" type produced by
 Supported kinds: numbers (bounded by the Zig type's own range, e.g. `u8` is
 0..255), strings, booleans, arrays, objects (nested structs, shared via
 `$defs`, recursion included), tagged unions (`union(enum)`, as `oneOf`,
-either externally or internally tagged) and integer newtypes
+either externally or internally tagged, or as `anyOf` when untagged) and integer newtypes
 (non-exhaustive enums). `SchemaOptions` (shared by `toSchema` and
 `fromJson`) picks the draft, how unknown object keys are handled, a root
 `$id`, and the JSON spelling of field names (`camelCase`, `snake_case`, ...).
+
+Keywords the constraint fields don't cover (`if` / `then` / `else`, `allOf`,
+`not`, `enum`, ...) go in `.extra`, as JSON text merged into the generated
+schema. It is checked at comptime (it must be a JSON object that doesn't
+contain a keyword the generator emits for that kind of value), and
+`fromJson` enforces it with the runtime validator:
+
+```zig
+const Payment = js.Schema(struct {
+    method: []const u8,
+    card_number: ?[]const u8,
+}, .{ .extra =
+    \\{"if": {"properties": {"method": {"const": "card"}}},
+    \\ "then": {"required": ["card_number"]}}
+});
+```
 
 ## The runtime validator
 

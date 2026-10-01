@@ -1,0 +1,97 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "payment": {
+      "type": "object",
+      "properties": {
+        "method": {
+          "type": "string"
+        },
+        "card_number": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "method"
+      ],
+      "if": {
+        "properties": {
+          "method": {
+            "const": "card"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "card_number"
+        ]
+      }
+    },
+    "country": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 2,
+      "enum": [
+        "jp",
+        "us",
+        null
+      ]
+    },
+    "home": {
+      "$ref": "#/definitions/PostalAddress"
+    },
+    "work": {
+      "type": "object",
+      "description": "Work address",
+      "properties": {
+        "city": {
+          "type": "string"
+        },
+        "zip": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "city"
+      ],
+      "dependentRequired": {
+        "zip": [
+          "city"
+        ]
+      }
+    }
+  },
+  "required": [
+    "payment",
+    "home",
+    "work"
+  ],
+  "definitions": {
+    "PostalAddress": {
+      "type": "object",
+      "properties": {
+        "city": {
+          "type": "string"
+        },
+        "zip": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "city"
+      ]
+    }
+  }
+}

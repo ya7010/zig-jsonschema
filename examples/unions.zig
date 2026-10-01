@@ -1,10 +1,14 @@
-//! Example: tagged unions (`union(enum)`), which become `oneOf`.
+//! Example: tagged unions (`union(enum)`), which become `oneOf` (or `anyOf`
+//! when untagged).
 //!
 //! - By default a value is externally tagged, as std.json writes unions:
 //!   `{"circle": {"radius": 1}}` (a void variant is `{"none": {}}`).
 //! - `pub const json_discriminator = "kind";` makes a union internally
 //!   tagged: `{"kind": "circle", "radius": 1}`. Every variant must then be a
 //!   struct or void.
+//! - `pub const json_untagged = true;` writes the bare payload: `5` or
+//!   `"five"`. The schema is an `anyOf`, and `fromJson` takes the first
+//!   variant (in declaration order) that accepts the value.
 const std = @import("std");
 const js = @import("jsonschema");
 const Schema = js.Schema;
@@ -27,6 +31,13 @@ const Event = union(enum) {
     signed_in: struct { user: []const u8 },
     signed_out: struct { user: []const u8, reason: ?[]const u8 },
     heartbeat,
+};
+
+/// Untagged: an id may be a number or a non-empty string.
+const Id = union(enum) {
+    pub const json_untagged = true;
+    num: u64,
+    str: Schema([]const u8, .{ .minLength = 1 }),
 };
 
 /// A recursive union: a single-item pointer (or a slice) breaks the cycle.
@@ -102,6 +113,22 @@ pub fn main() !void {
     std.debug.print("\n== Invalid events ==\n", .{});
     for ([_][]const u8{ "{\"type\": \"crashed\"}", "{\"user\": \"ada\"}" }) |text| {
         for ((try js.fromJson(Event, a, text, .{})).errors.items) |err| {
+            std.debug.print("{s}\n  -> {s}: {s}\n", .{ text, if (err.path.len == 0) "(root)" else err.path, err.message });
+        }
+    }
+
+    // --- Untagged: the payload alone, the first matching variant wins.
+    try printJson(a, "Id (untagged, anyOf)", try js.toSchema(Id, a, .{}));
+    std.debug.print("\n== Decoded ids ==\n", .{});
+    for ([_][]const u8{ "42", "\"ada\"" }) |text| {
+        switch ((try js.fromJson(Id, a, text, .{})).value.?) {
+            .num => |n| std.debug.print("{s} -> num {d}\n", .{ text, n }),
+            .str => |s| std.debug.print("{s} -> str \"{s}\"\n", .{ text, s }),
+        }
+    }
+    std.debug.print("\n== Invalid ids (every variant's reason) ==\n", .{});
+    for ([_][]const u8{ "\"\"", "true" }) |text| {
+        for ((try js.fromJson(Id, a, text, .{})).errors.items) |err| {
             std.debug.print("{s}\n  -> {s}: {s}\n", .{ text, if (err.path.len == 0) "(root)" else err.path, err.message });
         }
     }
