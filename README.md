@@ -62,12 +62,13 @@ value you actually read and write is the "plain" type produced by
 
 Supported kinds: numbers (bounded by the Zig type's own range, e.g. `u8` is
 0..255), strings, booleans, arrays, objects (nested structs, shared via
-`$defs`, recursion included), tagged unions (`union(enum)`, as `oneOf`,
+`$defs`, recursion included, or flattened into the enclosing object with
+`.flatten`), tagged unions (`union(enum)`, as `oneOf`,
 either externally or internally tagged, or as `anyOf` when untagged) and integer newtypes
 (non-exhaustive enums). `SchemaOptions` (shared by `toSchema` and
 `fromJson`) picks the draft, how unknown object keys are handled, a root
 `$id`, the JSON spelling of field names (`camelCase`, `snake_case`, ...),
-and whether internally tagged unions are written as `oneOf` or as
+and whether tagged unions are written as `oneOf` or as
 `if` / `then` per variant (`union_encoding`, for clearer errors in other
 validators).
 

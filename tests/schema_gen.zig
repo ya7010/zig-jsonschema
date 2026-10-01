@@ -273,7 +273,7 @@ test "unions: external and internal tagging, void variants, optional unions" {
     });
 }
 
-test "unions_if_then: internally tagged unions as if/then (oneOf before draft 7)" {
+test "unions_if_then: tagged unions as if/then (oneOf before draft 7)" {
     try checkCaseWith("unions_if_then", struct {
         tagged: TaggedShape,
         inline_tagged: union(enum) {
@@ -281,8 +281,10 @@ test "unions_if_then: internally tagged unions as if/then (oneOf before draft 7)
             on: struct { level: u8 },
             off,
         },
-        /// Not internally tagged: unchanged.
+        /// Externally tagged: the single key names the variant.
         shape: Shape,
+        /// Untagged: unchanged (anyOf).
+        id: Id,
     }, .{ .union_encoding = .if_then });
 }
 
@@ -388,4 +390,21 @@ test "custom_schema: types with their own jsonSchema, shared, embedded and optio
         accent: ?Color,
         background: Gradient,
     });
+}
+
+const Timestamps = struct {
+    created_at: Schema(i64, .{ .minimum = 0 }),
+    updated_at: ?i64,
+};
+
+test "flatten: a struct's fields merged into the enclosing object, nested and under deny" {
+    try checkCaseWith("flatten", struct {
+        title: []const u8,
+        audit: Schema(struct {
+            times: Schema(Timestamps, .{ .flatten = true }),
+            author: []const u8,
+        }, .{ .flatten = true }),
+        /// Not flattened: a nested object as usual.
+        stamp: Timestamps,
+    }, .{ .unknown_fields = .deny });
 }

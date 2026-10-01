@@ -43,12 +43,16 @@
     },
     "shape": {
       "$ref": "#/definitions/Shape"
+    },
+    "id": {
+      "$ref": "#/definitions/Id"
     }
   },
   "required": [
     "tagged",
     "inline_tagged",
-    "shape"
+    "shape",
+    "id"
   ],
   "definitions": {
     "TaggedShape": {
@@ -188,6 +192,19 @@
       "required": [
         "width",
         "height"
+      ]
+    },
+    "Id": {
+      "anyOf": [
+        {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        {
+          "type": "string",
+          "minLength": 1
+        }
       ]
     }
   }

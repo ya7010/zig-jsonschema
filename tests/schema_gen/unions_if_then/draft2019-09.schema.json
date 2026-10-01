@@ -75,12 +75,16 @@
     },
     "shape": {
       "$ref": "#/$defs/Shape"
+    },
+    "id": {
+      "$ref": "#/$defs/Id"
     }
   },
   "required": [
     "tagged",
     "inline_tagged",
-    "shape"
+    "shape",
+    "id"
   ],
   "$defs": {
     "TaggedShape": {
@@ -183,56 +187,75 @@
       ]
     },
     "Shape": {
-      "oneOf": [
+      "type": "object",
+      "minProperties": 1,
+      "maxProperties": 1,
+      "propertyNames": {
+        "enum": [
+          "circle",
+          "rect",
+          "label",
+          "empty"
+        ]
+      },
+      "allOf": [
         {
-          "type": "object",
-          "properties": {
-            "circle": {
-              "$ref": "#/$defs/Circle"
-            }
+          "if": {
+            "required": [
+              "circle"
+            ]
           },
-          "required": [
-            "circle"
-          ],
-          "additionalProperties": false
+          "then": {
+            "properties": {
+              "circle": {
+                "$ref": "#/$defs/Circle"
+              }
+            }
+          }
         },
         {
-          "type": "object",
-          "properties": {
-            "rect": {
-              "$ref": "#/$defs/Rect"
-            }
+          "if": {
+            "required": [
+              "rect"
+            ]
           },
-          "required": [
-            "rect"
-          ],
-          "additionalProperties": false
+          "then": {
+            "properties": {
+              "rect": {
+                "$ref": "#/$defs/Rect"
+              }
+            }
+          }
         },
         {
-          "type": "object",
-          "properties": {
-            "label": {
-              "type": "string",
-              "minLength": 1
-            }
+          "if": {
+            "required": [
+              "label"
+            ]
           },
-          "required": [
-            "label"
-          ],
-          "additionalProperties": false
+          "then": {
+            "properties": {
+              "label": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
         },
         {
-          "type": "object",
-          "properties": {
-            "empty": {
-              "type": "object",
-              "maxProperties": 0
-            }
+          "if": {
+            "required": [
+              "empty"
+            ]
           },
-          "required": [
-            "empty"
-          ],
-          "additionalProperties": false
+          "then": {
+            "properties": {
+              "empty": {
+                "type": "object",
+                "maxProperties": 0
+              }
+            }
+          }
         }
       ]
     },
@@ -261,6 +284,19 @@
       "required": [
         "width",
         "height"
+      ]
+    },
+    "Id": {
+      "anyOf": [
+        {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        {
+          "type": "string",
+          "minLength": 1
+        }
       ]
     }
   }

@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2019-09/schema",
+  "type": "object",
+  "properties": {
+    "title": {
+      "type": "string"
+    },
+    "created_at": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9223372036854775807
+    },
+    "updated_at": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": -9223372036854775808,
+      "maximum": 9223372036854775807
+    },
+    "author": {
+      "type": "string"
+    },
+    "stamp": {
+      "$ref": "#/$defs/Timestamps"
+    }
+  },
+  "required": [
+    "title",
+    "created_at",
+    "author",
+    "stamp"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "Timestamps": {
+      "type": "object",
+      "properties": {
+        "created_at": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
+        "updated_at": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": -9223372036854775808,
+          "maximum": 9223372036854775807
+        }
+      },
+      "required": [
+        "created_at"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

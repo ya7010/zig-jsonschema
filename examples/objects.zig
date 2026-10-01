@@ -1,5 +1,6 @@
 //! Example: objects. Nested structs, arrays of structs, optional objects,
-//! object-level constraints, unknown keys, shared `$defs` and recursion.
+//! object-level constraints, unknown keys, shared `$defs`, recursion and
+//! flattened structs.
 const std = @import("std");
 const js = @import("jsonschema");
 const Schema = js.Schema;
@@ -109,7 +110,28 @@ pub fn main() !void {
     , .{})).value.?;
     std.debug.print("\n== Decoded tree ==\n", .{});
     printTree(tree, 0);
+
+    // --- Flattening: a struct's fields written into the enclosing object.
+    try printJson(a, "Article (Timestamps flattened)", try js.toSchema(Article, a, .{}));
+    const article = (try js.fromJson(Article, a,
+        \\{"title": "Hello", "created_at": 1700000000, "updated_at": null}
+    , .{ .unknown_fields = .deny })).value.?;
+    std.debug.print("\n== Decoded article ==\n{s}, created at {d}\n", .{ article.title, article.times.created_at });
 }
+
+/// Fields shared by several types.
+const Timestamps = struct {
+    created_at: i64,
+    updated_at: ?i64,
+};
+
+/// `{"title": ..., "created_at": ..., "updated_at": ...}`, read into
+/// `.times.created_at`. A field named like one of Timestamps' would be a
+/// compile error.
+const Article = struct {
+    title: []const u8,
+    times: Schema(Timestamps, .{ .flatten = true }),
+};
 
 const Tags = struct { color: []const u8 };
 

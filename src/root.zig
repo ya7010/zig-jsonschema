@@ -146,6 +146,14 @@ pub const ObjectConstraints = struct {
     additionalProperties: ?bool = null,
     /// Extra JSON Schema keywords merged into this schema (see `Schema()`).
     extra: ?[]const u8 = null,
+    /// On a struct field, writes the fields of this struct into the
+    /// enclosing object rather than under the field's own key, as serde's
+    /// `flatten` does: `meta: Schema(Timestamps, .{ .flatten = true })`
+    /// reads `{"name": ..., "created_at": ...}` into `.meta.created_at`.
+    /// The generated schema lists those fields as the enclosing object's
+    /// own. The struct cannot be optional, have other constraints, or have
+    /// a field named like one of the enclosing struct's.
+    flatten: bool = false,
 };
 
 /// Constraints for a tagged union (`union(enum)`), which maps to a `oneOf`
@@ -252,7 +260,7 @@ fn discriminatorOf(comptime T: type) ?[]const u8 {
             .@"struct" => {
                 if (hasCustomSchema(Payload)) @compileError("jsonschema: variant '" ++ f.name ++ "' of internally tagged union " ++
                     @typeName(T) ++ " cannot have a custom jsonSchema (its fields sit next to the discriminator)");
-                if (@hasField(Payload, key)) @compileError("jsonschema: variant '" ++ f.name ++ "' of " ++
+                for (propertyNames(Payload)) |n| if (std.mem.eql(u8, n, key)) @compileError("jsonschema: variant '" ++ f.name ++ "' of " ++
                     @typeName(T) ++ " has a field named like the discriminator '" ++ key ++ "'");
                 // Its keywords would sit next to the discriminator, which
                 // `fromJson` strips before decoding the payload.
@@ -280,7 +288,7 @@ fn generatedKeywords(comptime C: type) []const []const u8 {
         ObjectConstraints => &.{ "properties", "required", "additionalProperties", "minProperties", "maxProperties" },
         // An optional union is `anyOf: [<union>, null]`.
         // `.if_then` writes an object with `allOf`.
-        UnionConstraints => &.{ "oneOf", "anyOf", "allOf", "properties", "required" },
+        UnionConstraints => &.{ "oneOf", "anyOf", "allOf", "properties", "required", "minProperties", "maxProperties", "propertyNames" },
         else => unreachable,
     };
     return &common ++ own;
@@ -490,6 +498,34 @@ const ComptimeJson = struct {
     }
 };
 
+/// Whether struct field type `F` is `Schema(S, .{ .flatten = true })`.
+fn isFlattened(comptime F: type) bool {
+    return isSchema(F) and @TypeOf(F.zjs_constraints) == ObjectConstraints and F.zjs_constraints.flatten;
+}
+
+fn rejectFlattened(comptime F: type) void {
+    if (isFlattened(F)) @compileError("jsonschema: flatten only applies to a struct field (" ++ @typeName(F.zjs_inner) ++ ")");
+}
+
+/// The Zig names of the JSON properties of struct `T`, flattened fields
+/// expanded; two of them may not be the same.
+fn propertyNames(comptime T: type) []const []const u8 {
+    comptime {
+        var names: []const []const u8 = &.{};
+        for (@typeInfo(T).@"struct".fields) |f| {
+            const more: []const []const u8 = if (isFlattened(f.type)) propertyNames(f.type.zjs_inner) else &.{f.name};
+            for (more) |n| {
+                for (names) |m| if (std.mem.eql(u8, m, n)) {
+                    @compileError("jsonschema: " ++ @typeName(T) ++ " has two properties named '" ++ n ++ "' (through a flattened field)");
+                };
+                names = names ++ &[_][]const u8{n};
+            }
+        }
+        const final = names[0..names.len].*;
+        return &final;
+    }
+}
+
 /// `T` below its `Schema()` label, if any.
 fn stripSchema(comptime T: type) type {
     return if (isSchema(T)) T.zjs_inner else T;
@@ -541,6 +577,14 @@ pub fn Schema(comptime T: type, comptime constraints: ConstraintsFor(T)) type {
             "put the keywords in its jsonSchema");
     }
     if (constraints.extra) |text| _ = extraKeys(@TypeOf(constraints), text);
+    if (@TypeOf(constraints) == ObjectConstraints and constraints.flatten) {
+        if (@typeInfo(T) != .@"struct") @compileError("jsonschema: only a struct can be flattened, not " ++ @typeName(T));
+        var others = constraints;
+        others.flatten = false;
+        if (!std.meta.eql(others, ObjectConstraints{})) {
+            @compileError("jsonschema: a flattened struct (" ++ @typeName(T) ++ ") cannot have other constraints: its fields belong to the enclosing object");
+        }
+    }
     return struct {
         pub const zjs_is_schema = true;
         pub const zjs_inner = T;
@@ -771,9 +815,9 @@ pub const SchemaOptions = struct {
     /// instead of inlining it at each use. Recursive types are always
     /// emitted this way. Generation only.
     reuse_definitions: bool = true,
-    /// How internally tagged unions (`json_discriminator`) are written.
-    /// Both accept the same documents; they differ in the errors other
-    /// validators report. Generation only.
+    /// How tagged unions (externally or internally) are written. Both
+    /// accept the same documents; they differ in the errors validators
+    /// report. Generation only.
     union_encoding: UnionEncoding = .one_of,
 };
 
@@ -781,9 +825,11 @@ pub const UnionEncoding = enum {
     /// `oneOf` with one branch per variant. A validator tries every branch,
     /// so an invalid value gets the errors of every variant.
     one_of,
-    /// `allOf` of `if: {<discriminator> is "<variant>"}, then: <variant>`,
-    /// so a validator reports only the errors of the variant the
-    /// discriminator names (or that the discriminator itself is invalid).
+    /// `allOf` of `if: {<the tag names "<variant>">}, then: <variant>`, so
+    /// a validator reports only the errors of the variant the tag names (or
+    /// that the tag itself is invalid). The tag is the discriminator of an
+    /// internally tagged union, or the single key of an externally tagged
+    /// one (`{"<variant>": <payload>}`); untagged unions are unaffected.
     /// Drafts 4 and 6, which have no `if` / `then`, get `one_of`.
     if_then,
 };
@@ -1070,6 +1116,9 @@ fn shortTypeName(allocator: Allocator, type_name: []const u8) Allocator.Error![]
 }
 
 fn buildSchema(comptime Decl: type, gen: *Gen) Allocator.Error!std.json.Value {
+    // Struct fields handle flattening themselves (`addProperties`).
+    comptime rejectFlattened(Decl);
+    if (comptime @typeInfo(Decl) == .optional) comptime rejectFlattened(@typeInfo(Decl).optional.child);
     if (comptime isSchema(Decl)) {
         return withExtra(try buildSchemaFor(Decl.zjs_inner, Decl.zjs_constraints, gen), Decl.zjs_constraints.extra, gen.allocator);
     }
@@ -1147,6 +1196,20 @@ fn buildSchemaFor(comptime T: type, constraints: ConstraintsFor(T), gen: *Gen) A
         .@"struct" => return buildStructUse(T, constraints, gen),
         .@"union" => return buildUnionUse(T, constraints, gen),
         else => @compileError("jsonschema: unsupported type " ++ @typeName(T)),
+    }
+}
+
+/// The properties of struct `StructT`, the fields of flattened ones included.
+fn addProperties(comptime StructT: type, props: *std.json.ObjectMap, required: *std.json.Array, gen: *Gen) Allocator.Error!void {
+    _ = comptime propertyNames(StructT); // no duplicates
+    inline for (@typeInfo(StructT).@"struct".fields) |f| {
+        if (comptime isFlattened(f.type)) {
+            try addProperties(f.type.zjs_inner, props, required, gen);
+        } else {
+            const name = jsonName(f.name, gen.options.field_naming);
+            try props.put(gen.allocator, name, try buildSchema(f.type, gen));
+            if (!isOptionalField(f)) try required.append(.{ .string = name });
+        }
     }
 }
 
@@ -1299,15 +1362,17 @@ fn buildUnionSchema(comptime T: type, constraints: UnionConstraints, gen: *Gen) 
     var obj: std.json.ObjectMap = .empty;
     if (constraints.title) |v| try obj.put(allocator, "title", .{ .string = v });
     if (constraints.description) |v| try obj.put(allocator, "description", .{ .string = v });
-    if (discriminator) |key| {
-        const has_if = switch (gen.options.draft) {
-            .draft4, .draft6 => false,
-            .draft7, .draft2019_09, .draft2020_12 => true,
-        };
-        if (gen.options.union_encoding == .if_then and has_if) {
+    const has_if = switch (gen.options.draft) {
+        .draft4, .draft6 => false,
+        .draft7, .draft2019_09, .draft2020_12 => true,
+    };
+    if (!untagged and gen.options.union_encoding == .if_then and has_if) {
+        if (discriminator) |key| {
             try putIfThenBranches(T, key, &obj, branches, gen);
-            return .{ .object = obj };
+        } else {
+            try putExternalIfThenBranches(T, &obj, branches, gen);
         }
+        return .{ .object = obj };
     }
     // Several untagged branches may match the same value.
     try obj.put(allocator, if (untagged) "anyOf" else "oneOf", .{ .array = branches });
@@ -1347,6 +1412,37 @@ fn putIfThenBranches(comptime T: type, key: []const u8, obj: *std.json.ObjectMap
     try obj.put(allocator, "type", .{ .string = "object" });
     try obj.put(allocator, "required", .{ .array = required });
     try obj.put(allocator, "properties", .{ .object = props });
+    try obj.put(allocator, "allOf", .{ .array = all_of });
+}
+
+/// `branches` (the `oneOf` branches of externally tagged union `T`, each
+/// `{"<variant>": <payload>}` and nothing else) as an object with exactly
+/// one key, a variant name, and `allOf: [{if: {<variant> is present},
+/// then: {<variant>: <payload>}}, ...]`: what the `oneOf` accepts.
+fn putExternalIfThenBranches(comptime T: type, obj: *std.json.ObjectMap, branches: std.json.Array, gen: *Gen) Allocator.Error!void {
+    const allocator = gen.allocator;
+    var names: std.json.Array = .init(allocator);
+    inline for (@typeInfo(T).@"union".fields) |f| try names.append(.{ .string = jsonName(f.name, gen.options.field_naming) });
+    var name_schema: std.json.ObjectMap = .empty;
+    try name_schema.put(allocator, "enum", .{ .array = names });
+
+    var all_of: std.json.Array = .init(allocator);
+    for (names.items, branches.items) |name, branch| {
+        var required: std.json.Array = .init(allocator);
+        try required.append(name);
+        var cond: std.json.ObjectMap = .empty;
+        try cond.put(allocator, "required", .{ .array = required });
+        var then: std.json.ObjectMap = .empty;
+        try then.put(allocator, "properties", branch.object.get("properties").?);
+        var item: std.json.ObjectMap = .empty;
+        try item.put(allocator, "if", .{ .object = cond });
+        try item.put(allocator, "then", .{ .object = then });
+        try all_of.append(.{ .object = item });
+    }
+    try obj.put(allocator, "type", .{ .string = "object" });
+    try obj.put(allocator, "minProperties", .{ .integer = 1 });
+    try obj.put(allocator, "maxProperties", .{ .integer = 1 });
+    try obj.put(allocator, "propertyNames", .{ .object = name_schema });
     try obj.put(allocator, "allOf", .{ .array = all_of });
 }
 
@@ -1528,7 +1624,6 @@ fn buildArraySchema(comptime Item: type, constraints: ArrayConstraints, gen: *Ge
 
 fn buildObjectSchema(comptime StructT: type, constraints: ObjectConstraints, tag: ?ObjectTag, gen: *Gen) Allocator.Error!std.json.Value {
     const allocator = gen.allocator;
-    const info = @typeInfo(StructT).@"struct";
     var props: std.json.ObjectMap = .empty;
     var required: std.json.Array = .init(allocator);
 
@@ -1546,14 +1641,7 @@ fn buildObjectSchema(comptime StructT: type, constraints: ObjectConstraints, tag
         try required.append(.{ .string = t.key });
     }
 
-    inline for (info.fields) |f| {
-        const name = jsonName(f.name, gen.options.field_naming);
-        const field_schema = try buildSchema(f.type, gen);
-        try props.put(allocator, name, field_schema);
-        if (!isOptionalField(f)) {
-            try required.append(.{ .string = name });
-        }
-    }
+    try addProperties(StructT, &props, &required, gen);
 
     var obj: std.json.ObjectMap = .empty;
     try obj.put(allocator, "type", .{ .string = "object" });
@@ -1637,7 +1725,8 @@ fn validatePath(
         },
         .@"struct" => |info| {
             inline for (info.fields) |f| {
-                const child_path = try childPath(path, jsonName(f.name, check.naming), allocator);
+                // A flattened struct's fields sit in this object.
+                const child_path = if (comptime isFlattened(f.type)) path else try childPath(path, jsonName(f.name, check.naming), allocator);
                 try validatePath(f.type, @field(value, f.name), child_path, check, allocator, errors);
             }
         },
@@ -1832,7 +1921,7 @@ fn checkObjectConstraints(
     allocator: Allocator,
     errors: *std.ArrayList(ValidationError),
 ) Allocator.Error!void {
-    const count = @typeInfo(StructT).@"struct".fields.len;
+    const count = comptime propertyNames(StructT).len;
     if (constraints.minProperties) |min| {
         if (count < min) try addError(errors, allocator, path, "object has {d} properties, less than minProperties {d}", .{ count, min });
     }
@@ -2055,6 +2144,8 @@ fn decodeValue(
     errors: *std.ArrayList(ValidationError),
 ) DecodeError!Unwrap(Decl) {
     if (comptime isSchema(Decl)) {
+        // Struct fields handle flattening themselves.
+        comptime rejectFlattened(Decl);
         const c = Decl.zjs_constraints;
         if (c.extra) |text| try checkExtra(Decl, @TypeOf(c), text, value, path, options, extras, allocator, errors);
         const explicit: ?bool = if (comptime @TypeOf(c) == ObjectConstraints) c.additionalProperties else null;
@@ -2166,7 +2257,16 @@ fn decodeValue(
             inline for (info.fields) |f| {
                 const name = jsonName(f.name, options.field_naming);
                 const child_path = try childPath(path, name, allocator);
-                if (value.object.get(name)) |sub_value| {
+                if (comptime isFlattened(f.type)) {
+                    // Its fields are this object's: decode them from it,
+                    // leaving unknown keys to this object (checked above).
+                    if (decodeValue(f.type.zjs_inner, value, path, true, options, extras, allocator, errors)) |decoded| {
+                        @field(result, f.name) = decoded;
+                    } else |err| switch (err) {
+                        error.Invalid => any_failed = true,
+                        else => |e| return e,
+                    }
+                } else if (value.object.get(name)) |sub_value| {
                     if (decodeValue(f.type, sub_value, child_path, null, options, extras, allocator, errors)) |decoded| {
                         @field(result, f.name) = decoded;
                     } else |err| switch (err) {
@@ -2351,6 +2451,16 @@ fn numberText(value: std.json.Value, allocator: Allocator) Allocator.Error![]con
     };
 }
 
+/// Whether `key` is a JSON property of struct `StructT` (flattened fields included).
+fn isProperty(comptime StructT: type, key: []const u8, naming: FieldNaming) bool {
+    inline for (@typeInfo(StructT).@"struct".fields) |f| {
+        if (comptime isFlattened(f.type)) {
+            if (isProperty(f.type.zjs_inner, key, naming)) return true;
+        } else if (std.mem.eql(u8, jsonName(f.name, naming), key)) return true;
+    }
+    return false;
+}
+
 fn reportAdditionalProperties(
     comptime StructT: type,
     obj: std.json.ObjectMap,
@@ -2359,15 +2469,10 @@ fn reportAdditionalProperties(
     allocator: Allocator,
     errors: *std.ArrayList(ValidationError),
 ) Allocator.Error!bool {
-    const info = @typeInfo(StructT).@"struct";
     var found = false;
     var it = obj.iterator();
     while (it.next()) |entry| {
-        var known = false;
-        inline for (info.fields) |f| {
-            if (std.mem.eql(u8, jsonName(f.name, naming), entry.key_ptr.*)) known = true;
-        }
-        if (!known) {
+        if (!isProperty(StructT, entry.key_ptr.*, naming)) {
             found = true;
             const child_path = try childPath(path, entry.key_ptr.*, allocator);
             try addError(errors, allocator, child_path, "unexpected additional property", .{});
@@ -3680,7 +3785,7 @@ test "custom jsonSchema: a failing jsonParseFromValue is reported" {
     try std.testing.expect(std.mem.endsWith(u8, bad.errors.items[0].message, ".jsonParseFromValue failed: Odd"));
 }
 
-test "union_encoding if_then: other validators report only the named variant's errors" {
+test "union_encoding if_then: validators report only the named variant's errors" {
     const T = union_test_types;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -3688,9 +3793,12 @@ test "union_encoding if_then: other validators report only the named variant's e
 
     const Errors = struct {
         fn of(encoding: UnionEncoding, text: []const u8, alloc: Allocator) ![]const validator.Error {
+            return ofType(T.TaggedShape, encoding, text, alloc);
+        }
+        fn ofType(comptime U: type, encoding: UnionEncoding, text: []const u8, alloc: Allocator) ![]const validator.Error {
             var v = Validator.init(std.testing.allocator, .{});
             defer v.deinit();
-            const schema = try v.compile(try toSchema(T.TaggedShape, alloc, .{ .union_encoding = encoding }));
+            const schema = try v.compile(try toSchema(U, alloc, .{ .union_encoding = encoding }));
             return (try schema.validate(alloc, try std.json.parseFromSliceLeaky(std.json.Value, alloc, text, .{}))).errors;
         }
     };
@@ -3712,11 +3820,133 @@ test "union_encoding if_then: other validators report only the named variant's e
         try std.testing.expectEqual(@as(usize, 1), errors.len);
     }
 
+    // Externally tagged: the key names the variant.
+    const ext = try Errors.ofType(T.Shape, .if_then, "{\"circle\": {\"radius\": 0}}", a);
+    try std.testing.expectEqual(@as(usize, 1), ext.len);
+    try std.testing.expectEqualStrings("/circle/radius", ext[0].instance_location);
+    for ([_][]const u8{ "{\"triangle\": {}}", "{}", "{\"empty\": {\"x\": 1}}" }) |text| {
+        try std.testing.expectEqual(@as(usize, 1), (try Errors.ofType(T.Shape, .if_then, text, a)).len);
+    }
+
     // Drafts without if/then keep oneOf.
     for ([_]Draft{ .draft4, .draft6 }) |d| {
         const schema = try toSchema(T.TaggedShape, a, .{ .draft = d, .union_encoding = .if_then });
         try std.testing.expect(schema.object.get("oneOf") != null);
+        try std.testing.expect((try toSchema(T.Shape, a, .{ .draft = d, .union_encoding = .if_then })).object.get("oneOf") != null);
     }
+}
+
+const flatten_test_types = struct {
+    const Timestamps = struct {
+        created_at: Schema(i64, .{ .minimum = 0 }),
+        updated_at: ?i64,
+    };
+    /// Flattens another flattened struct in turn.
+    const Audit = struct {
+        times: Schema(Timestamps, .{ .flatten = true }),
+        author_name: []const u8,
+    };
+    const Post = struct {
+        title: Schema([]const u8, .{ .minLength = 1 }),
+        audit: Schema(Audit, .{ .flatten = true }),
+        /// Named, so also shared through $defs elsewhere.
+        stamp: Timestamps,
+    };
+    const Event = union(enum) {
+        pub const json_discriminator = "kind";
+        posted: struct { id: u32, times: Schema(Timestamps, .{ .flatten = true }) },
+        deleted,
+    };
+    const Feed = Schema(struct {
+        post: Post,
+        event: Event,
+    }, .{ .minProperties = 2 });
+};
+
+test "flatten: toSchema and fromJson agree, fields read from the enclosing object" {
+    const T = flatten_test_types;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const stamp =
+        \\"stamp": {"created_at": 1}
+    ;
+    const event =
+        \\"event": {"kind": "posted", "id": 1, "created_at": 5}
+    ;
+    const cases = [_][]const u8{
+        "{\"post\": {\"title\": \"t\", \"created_at\": 1, \"updated_at\": 2, \"author_name\": \"ada\", " ++ stamp ++ "}, " ++ event ++ "}",
+        "{\"post\": {\"title\": \"t\", \"created_at\": 1, \"author_name\": \"ada\", " ++ stamp ++ "}, " ++ event ++ "}",
+        "{\"post\": {\"title\": \"t\", \"created_at\": -1, \"author_name\": \"ada\", " ++ stamp ++ "}, " ++ event ++ "}",
+        "{\"post\": {\"title\": \"t\", \"author_name\": \"ada\", " ++ stamp ++ "}, " ++ event ++ "}",
+        "{\"post\": {\"title\": \"t\", \"created_at\": 1, " ++ stamp ++ "}, " ++ event ++ "}",
+        "{\"post\": {\"title\": \"t\", \"created_at\": 1, \"author_name\": \"ada\", \"extra\": 1, " ++ stamp ++ "}, " ++ event ++ "}",
+        "{\"post\": {\"title\": \"t\", \"audit\": {\"author_name\": \"ada\"}, \"created_at\": 1, \"author_name\": \"ada\", " ++ stamp ++ "}, " ++ event ++ "}",
+        "{\"post\": {\"title\": \"t\", \"created_at\": 1, \"author_name\": \"ada\", " ++ stamp ++ "}, \"event\": {\"kind\": \"posted\", \"id\": 1}}",
+        "{\"post\": {\"title\": \"t\", \"created_at\": 1, \"author_name\": \"ada\", " ++ stamp ++ "}, \"event\": {\"kind\": \"posted\", \"id\": 1, \"created_at\": 1, \"x\": 0}}",
+        "{\"post\": {\"title\": \"t\", \"created_at\": 1, \"author_name\": \"ada\", " ++ stamp ++ "}, \"event\": {\"kind\": \"deleted\"}}",
+    };
+
+    inline for (std.meta.fields(Draft)) |f| {
+        for ([_]UnknownFields{ .allow, .deny }) |unknown| {
+            for ([_]bool{ true, false }) |reuse| {
+                for ([_]UnionEncoding{ .one_of, .if_then }) |encoding| {
+                    const options: SchemaOptions = .{ .draft = @enumFromInt(f.value), .unknown_fields = unknown, .reuse_definitions = reuse, .union_encoding = encoding };
+                    var v = Validator.init(std.testing.allocator, .{});
+                    defer v.deinit();
+                    const generated = try toSchema(T.Feed, a, options);
+                    try std.testing.expect(try v.isValidSchema(generated));
+                    const schema = try v.compile(generated);
+                    for (cases) |text| {
+                        const result = try fromJson(T.Feed, a, text, options);
+                        const instance = try std.json.parseFromSliceLeaky(std.json.Value, a, text, .{});
+                        const valid = try schema.isValid(instance);
+                        if ((result.value != null) != valid) {
+                            std.debug.print("{s} ({s}, {t}, {t}, reuse={}): fromJson {}, schema {}\n", .{ text, f.name, unknown, encoding, reuse, result.value != null, valid });
+                            for (result.errors.items) |e| std.debug.print("  {s}: {s}\n", .{ e.path, e.message });
+                            return error.TestUnexpectedResult;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // The flattened fields are listed as the post's own.
+    const generated = try toSchema(T.Feed, a, .{});
+    const post = generated.object.get("$defs").?.object.get("Post").?.object;
+    const keys = post.get("properties").?.object.keys();
+    const expected = [_][]const u8{ "title", "created_at", "updated_at", "author_name", "stamp" };
+    try std.testing.expectEqual(expected.len, keys.len);
+    for (expected, keys) |want, got| try std.testing.expectEqualStrings(want, got);
+    const required = post.get("required").?.array.items;
+    const want_required = [_][]const u8{ "title", "created_at", "author_name", "stamp" };
+    try std.testing.expectEqual(want_required.len, required.len);
+    for (want_required, required) |want, got| try std.testing.expectEqualStrings(want, got.string);
+
+    const feed = (try fromJson(T.Feed, a,
+        \\{"post": {"title": "t", "created_at": 3, "updated_at": 4, "author_name": "ada", "stamp": {"created_at": 9}}, "event": {"kind": "posted", "id": 7, "created_at": 5}}
+    , .{})).value.?;
+    try std.testing.expectEqual(@as(i64, 3), feed.post.audit.times.created_at);
+    try std.testing.expectEqual(@as(?i64, 4), feed.post.audit.times.updated_at);
+    try std.testing.expectEqualStrings("ada", feed.post.audit.author_name);
+    try std.testing.expectEqual(@as(i64, 5), feed.event.posted.times.created_at);
+
+    // Errors sit at the enclosing object's keys, in fromJson and validate.
+    const bad = try fromJson(T.Feed, a,
+        \\{"post": {"title": "t", "created_at": -1, "stamp": {"created_at": 9}}, "event": {"kind": "deleted"}}
+    , .{});
+    try std.testing.expectEqual(@as(usize, 1), bad.errors.items.len);
+    try std.testing.expectEqualStrings("post.author_name", bad.errors.items[0].path);
+    var errors: std.ArrayList(ValidationError) = .empty;
+    try validate(T.Post, .{
+        .title = "t",
+        .audit = .{ .times = .{ .created_at = -1, .updated_at = null }, .author_name = "ada" },
+        .stamp = .{ .created_at = 1, .updated_at = null },
+    }, a, &errors);
+    try std.testing.expectEqual(@as(usize, 1), errors.items.len);
+    try std.testing.expectEqualStrings("created_at", errors.items[0].path);
 }
 
 test "recursive unions are shared through definitions" {
