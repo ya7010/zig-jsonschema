@@ -37,7 +37,7 @@ pub fn main() !void {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const schema = try js.toSchema(Order, a, .{});
+    const schema = (try js.toSchema(Order, a, .{})).schema.?;
     std.debug.print("== Order schema ==\n{s}\n", .{try std.json.Stringify.valueAlloc(a, schema, .{ .whitespace = .indent_2 })});
 
     const text =

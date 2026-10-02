@@ -40,7 +40,7 @@ fn checkCaseWith(comptime case_name: []const u8, comptime Decl: type, base: js.S
     for (drafts) |d| {
         var opts = base;
         opts.draft = d.draft;
-        const schema = try js.toSchema(Decl, arena, opts);
+        const schema = (try js.toSchema(Decl, arena, opts)).schema.?;
         const actual = try std.fmt.allocPrint(arena, "{s}\n", .{
             try std.json.Stringify.valueAlloc(arena, schema, .{ .whitespace = .indent_2 }),
         });

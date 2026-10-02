@@ -27,7 +27,7 @@ pub fn main() !void {
         .field_naming = .camel_case,
         .unknown_fields = .deny,
     };
-    try printJson(a, "camelCase, unknown keys denied, with $id (draft 2020-12)", try js.toSchema(Profile, a, api));
+    try printJson(a, "camelCase, unknown keys denied, with $id (draft 2020-12)", (try js.toSchema(Profile, a, api)).schema.?);
 
     const text =
         \\{"userName": "ada", "homeAddress": {"postalCode": "100-0001", "cityName": "Tokyo"},
@@ -52,14 +52,27 @@ pub fn main() !void {
 
     // Other drafts: draft 4 writes exclusive bounds as booleans and uses
     // `id` and `definitions`.
-    try printJson(a, "draft 4", try js.toSchema(Profile, a, .{ .draft = .draft4, .id = "https://example.com/schemas/profile.json" }));
+    try printJson(a, "draft 4", (try js.toSchema(Profile, a, .{ .draft = .draft4, .id = "https://example.com/schemas/profile.json" })).schema.?);
 
     // Everything inlined, without $schema (e.g. to embed in another document).
-    try printJson(a, "emit_schema_uri = false, reuse_definitions = false", try js.toSchema(Profile, a, .{
+    try printJson(a, "emit_schema_uri = false, reuse_definitions = false", (try js.toSchema(Profile, a, .{
         .emit_schema_uri = false,
         .reuse_definitions = false,
         .field_naming = .snake_case,
-    }));
+    })).schema.?);
+
+    // Names that field_naming turns into the same key are refused: toSchema
+    // returns no schema and fromJson no value, but every collision (as does
+    // fieldNameCollisions, to see which names to rename).
+    const Clash = struct { user_id: u32, userId: u32, home_page: []const u8, homePage: []const u8 };
+    const camel: js.SchemaOptions = .{ .field_naming = .camel_case };
+    std.debug.print("\n== field_naming collisions ==\n", .{});
+    const generated = try js.toSchema(Clash, a, camel);
+    std.debug.print("toSchema: schema is null: {}\n", .{generated.schema == null});
+    for (generated.errors.items) |collision| std.debug.print("  {f}\n", .{collision});
+    std.debug.print("fromJson:\n", .{});
+    for ((try js.fromJson(Clash, a, "{}", camel)).errors.items) |err| std.debug.print("  {s}\n", .{err.message});
+    std.debug.print("as_is is fine: {}\n", .{js.fieldNameCollisions(Clash, .as_is).len == 0});
 }
 
 fn printJson(a: std.mem.Allocator, title: []const u8, value: std.json.Value) !void {

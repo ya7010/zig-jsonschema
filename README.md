@@ -46,8 +46,12 @@ pub fn main() !void {
     defer arena.deinit();
     const a = arena.allocator();
 
-    // Generate a JSON Schema document from the declaration.
-    const schema = try js.toSchema(Product, a, .{});
+    // Generate a JSON Schema document from the declaration. `.schema` is null
+    // only if `.errors` is not empty (names that `field_naming` makes the same
+    // key), as `fromJson` reports its errors.
+    const generated = try js.toSchema(Product, a, .{});
+    const schema = generated.schema.?;
+    _ = schema;
 
     // Decode JSON into a plain Zig value (js.Unwrap(Product)), validating
     // in the same pass. `result.value` is null if `errors` is non-empty.

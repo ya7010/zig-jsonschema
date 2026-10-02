@@ -808,8 +808,10 @@ pub const SchemaOptions = struct {
     /// every object whose `Schema()` does not set `additionalProperties`
     /// explicitly (an explicit setting always wins).
     unknown_fields: UnknownFields = .allow,
-    /// How struct field names are spelled as JSON object keys. Two fields
-    /// must not map to the same key.
+    /// How struct field names are spelled as JSON object keys (and union
+    /// variant names as tags). Two fields, or two variants, that map to
+    /// the same key are an error: `toSchema` returns no schema and
+    /// `fromJson` no value, but every collision (see `fieldNameCollisions`).
     field_naming: FieldNaming = .as_is,
     /// Emit every named struct type (other than the root) once under
     /// `$defs` (`definitions` before 2019-09) and refer to it with `$ref`,
@@ -859,6 +861,122 @@ pub const FieldNaming = enum {
 };
 
 /// The JSON key of the field named `name`.
+/// Two names of one type that `field_naming` turns into the same JSON key,
+/// which `fieldNameCollisions` finds.
+pub const FieldNameCollision = struct {
+    /// The struct or union they belong to.
+    type_name: []const u8,
+    naming: FieldNaming,
+    what: enum {
+        /// Two properties of a struct (a flattened struct's included).
+        fields,
+        /// Two variants of a tagged union.
+        variants,
+        /// A property of an internally tagged union's variant and the
+        /// discriminator, which is never renamed.
+        discriminator,
+    },
+    /// The Zig names (for `.discriminator`, the variant's field and the key).
+    first: []const u8,
+    second: []const u8,
+    /// The JSON key both become.
+    key: []const u8,
+
+    pub fn format(c: FieldNameCollision, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        switch (c.what) {
+            .fields => try w.print("{s}: fields '{s}' and '{s}' both become \"{s}\" under field_naming .{t}", .{ c.type_name, c.first, c.second, c.key, c.naming }),
+            .variants => try w.print("{s}: variants '{s}' and '{s}' both become \"{s}\" under field_naming .{t}", .{ c.type_name, c.first, c.second, c.key, c.naming }),
+            .discriminator => try w.print("{s}: field '{s}' becomes \"{s}\" under field_naming .{t}, the key of the discriminator", .{ c.type_name, c.first, c.key, c.naming }),
+        }
+    }
+};
+
+/// Every pair of names, in `Decl` or any type it contains, that `naming`
+/// turns into the same JSON key (empty if there is none). `toSchema` and
+/// `fromJson` refuse such a type; this tells which names to rename. A name
+/// is paired with the first earlier name it clashes with, so three names
+/// with the same key are two collisions.
+pub fn fieldNameCollisions(comptime Decl: type, naming: FieldNaming) []const FieldNameCollision {
+    return switch (naming) {
+        inline else => |n| comptime scanCollisions(Decl, n, .{}).found,
+    };
+}
+
+const CollisionScan = struct {
+    found: []const FieldNameCollision = &.{},
+    /// The types already searched (a type reached twice is reported once).
+    seen: []const type = &.{},
+};
+
+fn scanCollisions(comptime T: type, comptime naming: FieldNaming, comptime scan: CollisionScan) CollisionScan {
+    @setEvalBranchQuota(1_000_000);
+    // Distinct Zig names stay distinct, and the compile-time checks cover
+    // the discriminator.
+    if (naming == .as_is or hasCustomSchema(T)) return scan;
+    for (scan.seen) |v| if (v == T) return scan;
+
+    var out: CollisionScan = .{ .found = scan.found, .seen = scan.seen ++ &[_]type{T} };
+    if (!isSchema(T)) switch (@typeInfo(T)) {
+        .@"struct" => out.found = out.found ++ clashes(T, naming, .fields, propertyNames(T)),
+        .@"union" => {
+            if (!isUntagged(T)) {
+                var names: [@typeInfo(T).@"union".fields.len][]const u8 = undefined;
+                for (@typeInfo(T).@"union".fields, 0..) |f, i| names[i] = f.name;
+                out.found = out.found ++ clashes(T, naming, .variants, &names);
+            }
+            if (discriminatorOf(T)) |key| {
+                for (@typeInfo(T).@"union".fields) |f| {
+                    const Payload = stripSchema(f.type);
+                    if (@typeInfo(Payload) != .@"struct") continue;
+                    for (propertyNames(Payload)) |name| {
+                        if (std.mem.eql(u8, convertName(name, naming), key)) {
+                            out.found = out.found ++ &[_]FieldNameCollision{.{
+                                .type_name = @typeName(T),
+                                .naming = naming,
+                                .what = .discriminator,
+                                .first = name,
+                                .second = key,
+                                .key = key,
+                            }};
+                        }
+                    }
+                }
+            }
+        },
+        else => {},
+    };
+    for (containedTypes(T)) |C| out = scanCollisions(C, naming, out);
+    return out;
+}
+
+/// The collisions among `names` (of `T`) under `naming`: each name that
+/// maps to the same key as an earlier one.
+fn clashes(
+    comptime T: type,
+    comptime naming: FieldNaming,
+    comptime what: @FieldType(FieldNameCollision, "what"),
+    comptime names: []const []const u8,
+) []const FieldNameCollision {
+    var found: []const FieldNameCollision = &.{};
+    for (names, 0..) |later, i| {
+        const key = convertName(later, naming);
+        for (names[0..i]) |earlier| {
+            if (std.mem.eql(u8, convertName(earlier, naming), key)) {
+                found = found ++ &[_]FieldNameCollision{.{
+                    .type_name = @typeName(T),
+                    .naming = naming,
+                    .what = what,
+                    .first = earlier,
+                    .second = later,
+                    .key = key,
+                }};
+                break;
+            }
+        }
+    }
+    return found;
+}
+
 fn jsonName(comptime name: []const u8, naming: FieldNaming) []const u8 {
     return switch (naming) {
         inline else => |n| comptime convertName(name, n),
@@ -916,7 +1034,27 @@ fn additionalPropertiesFor(explicit: ?bool, options: SchemaOptions) ?bool {
 /// 2020-12 with `$schema`, named struct types shared via `$defs`. Every
 /// `std.json.Value` in the result is owned by `allocator` (using an
 /// `ArenaAllocator` at the call site is recommended).
-pub fn toSchema(comptime Decl: type, allocator: Allocator, options: SchemaOptions) Allocator.Error!std.json.Value {
+///
+/// If `options.field_naming` makes two field names, or two variant names,
+/// the same key, there is no schema: `schema` is null and `errors` has every
+/// collision (see `fieldNameCollisions`), as `fromJson` reports it.
+pub fn toSchema(comptime Decl: type, allocator: Allocator, options: SchemaOptions) Allocator.Error!ToSchemaResult {
+    var errors: std.ArrayList(FieldNameCollision) = .empty;
+    try errors.appendSlice(allocator, fieldNameCollisions(Decl, options.field_naming));
+    if (errors.items.len > 0) return .{ .schema = null, .errors = errors };
+    return .{ .schema = try generateSchema(Decl, allocator, options), .errors = errors };
+}
+
+/// What `toSchema` returns, like `fromJson`'s `FromJsonResult`: the schema,
+/// or the reasons there is none (all of them, not only the first).
+pub const ToSchemaResult = struct {
+    /// Null if `errors` is not empty.
+    schema: ?std.json.Value,
+    errors: std.ArrayList(FieldNameCollision),
+};
+
+/// `toSchema` once the names are known not to collide.
+fn generateSchema(comptime Decl: type, allocator: Allocator, options: SchemaOptions) Allocator.Error!std.json.Value {
     var gen: Gen = .{ .allocator = allocator, .options = options, .inline_next_struct = comptime rootIsStruct(Decl) };
     // A plain root struct that refers to itself is referenced as "#".
     if (comptime isNamedStruct(Decl)) try gen.refs.put(allocator, @typeName(Decl), "#");
@@ -2017,6 +2155,12 @@ fn decodeJson(
 ) Allocator.Error!FromJsonResult(Unwrap(Decl)) {
     var errors: std.ArrayList(ValidationError) = .empty;
 
+    const collisions = fieldNameCollisions(Decl, options.field_naming);
+    if (collisions.len > 0) {
+        for (collisions) |collision| try addError(&errors, allocator, "", "{f}", .{collision});
+        return .{ .value = null, .errors = errors };
+    }
+
     const json_value = std.json.parseFromSliceLeaky(std.json.Value, allocator, json_text, .{}) catch |err| {
         try addError(&errors, allocator, "", "invalid JSON: {s}", .{@errorName(err)});
         return .{ .value = null, .errors = errors };
@@ -2108,7 +2252,7 @@ const Extras = struct {
         var opts = options;
         opts.id = null;
         opts.emit_schema_uri = true;
-        const generated = try toSchema(Labelled, extras.arena.allocator(), opts);
+        const generated = try generateSchema(Labelled, extras.arena.allocator(), opts);
         const valid = extras.validator.isValidSchema(generated) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => false,
@@ -2596,7 +2740,7 @@ test "toSchema builds constraints for a Schema-wrapped numeric field" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const schema = try toSchema(Product, arena.allocator(), .{});
+    const schema = (try toSchema(Product, arena.allocator(), .{})).schema.?;
 
     const props = schema.object.get("properties").?.object;
     const price = props.get("price").?.object;
@@ -2627,7 +2771,7 @@ test "toSchema builds constraints for string, bool, array and object fields" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const schema = try toSchema(Product, arena.allocator(), .{});
+    const schema = (try toSchema(Product, arena.allocator(), .{})).schema.?;
     const props = schema.object.get("properties").?.object;
 
     const name = props.get("name").?.object;
@@ -2919,7 +3063,7 @@ test "toSchema output is a valid 2020-12 schema that the runtime Validator agree
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const generated = try toSchema(Product, allocator, .{});
+    const generated = (try toSchema(Product, allocator, .{})).schema.?;
     var v = Validator.init(std.testing.allocator, .{});
     defer v.deinit();
     try std.testing.expect(try v.isValidSchema(generated));
@@ -2957,7 +3101,7 @@ test "toSchema emits $schema and draft-specific keywords" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const d4 = try toSchema(Product, allocator, .{ .draft = .draft4 });
+    const d4 = (try toSchema(Product, allocator, .{ .draft = .draft4 })).schema.?;
     try std.testing.expectEqualStrings("http://json-schema.org/draft-04/schema#", d4.object.get("$schema").?.string);
     const price4 = d4.object.get("properties").?.object.get("price").?.object;
     try std.testing.expectEqual(@as(f64, 0), price4.get("minimum").?.float);
@@ -2965,14 +3109,14 @@ test "toSchema emits $schema and draft-specific keywords" {
     try std.testing.expectEqual(@as(f64, 100), price4.get("maximum").?.float);
     try std.testing.expect(price4.get("exclusiveMaximum") == null);
 
-    const d7 = try toSchema(Product, allocator, .{ .draft = .draft7 });
+    const d7 = (try toSchema(Product, allocator, .{ .draft = .draft7 })).schema.?;
     try std.testing.expectEqualStrings("http://json-schema.org/draft-07/schema#", d7.object.get("$schema").?.string);
     const price7 = d7.object.get("properties").?.object.get("price").?.object;
     try std.testing.expectEqual(@as(f64, 0), price7.get("exclusiveMinimum").?.float);
 
-    const d2020 = try toSchema(Product, allocator, .{});
+    const d2020 = (try toSchema(Product, allocator, .{})).schema.?;
     try std.testing.expectEqualStrings("https://json-schema.org/draft/2020-12/schema", d2020.object.get("$schema").?.string);
-    const plain = try toSchema(Product, allocator, .{ .emit_schema_uri = false });
+    const plain = (try toSchema(Product, allocator, .{ .emit_schema_uri = false })).schema.?;
     try std.testing.expect(plain.object.get("$schema") == null);
 }
 
@@ -2985,7 +3129,7 @@ test "toSchema emits the root id with the draft's keyword" {
     const id = "https://example.com/schemas/customer.json";
     inline for (std.meta.fields(Draft)) |f| {
         const draft: Draft = @enumFromInt(f.value);
-        const schema = try toSchema(T.Customer, a, .{ .draft = draft, .id = id });
+        const schema = (try toSchema(T.Customer, a, .{ .draft = draft, .id = id })).schema.?;
         const keyword, const other = if (draft == .draft4) .{ "id", "$id" } else .{ "$id", "id" };
         try std.testing.expectEqualStrings(id, schema.object.get(keyword).?.string);
         try std.testing.expect(schema.object.get(other) == null);
@@ -3004,7 +3148,7 @@ test "toSchema emits the root id with the draft's keyword" {
         try std.testing.expect(!try compiled.isValid(bad));
     }
 
-    const without = try toSchema(T.Customer, a, .{});
+    const without = (try toSchema(T.Customer, a, .{})).schema.?;
     try std.testing.expect(without.object.get("$id") == null);
 }
 
@@ -3061,7 +3205,7 @@ test "toSchema output is valid for every draft and matches fromJson" {
     inline for (std.meta.fields(Draft)) |f| {
         for ([_]UnknownFields{ .allow, .deny }) |mode| {
             const options: SchemaOptions = .{ .draft = @enumFromInt(f.value), .unknown_fields = mode };
-            const generated = try toSchema(Product, allocator, options);
+            const generated = (try toSchema(Product, allocator, options)).schema.?;
 
             // The runtime validator picks the dialect up from `$schema`, not from its default.
             var v = Validator.init(std.testing.allocator, .{ .default_draft = .draft2020_12 });
@@ -3154,7 +3298,7 @@ test "integer and narrow float ranges agree between toSchema and fromJson" {
         const options: SchemaOptions = .{ .draft = @enumFromInt(f.value) };
         var v = Validator.init(std.testing.allocator, .{});
         defer v.deinit();
-        const generated = try toSchema(T, a, options);
+        const generated = (try toSchema(T, a, options)).schema.?;
         try std.testing.expect(try v.isValidSchema(generated));
         const schema = try v.compile(generated);
         for (cases) |text| {
@@ -3210,7 +3354,7 @@ test "string pattern and code point lengths agree between toSchema and fromJson"
     };
     var v = Validator.init(std.testing.allocator, .{});
     defer v.deinit();
-    const schema = try v.compile(try toSchema(T, a, .{}));
+    const schema = try v.compile((try toSchema(T, a, .{})).schema.?);
     for (cases) |text| {
         const instance = try std.json.parseFromSliceLeaky(std.json.Value, a, text, .{});
         const decoded = (try fromJson(T, a, text, .{})).value != null;
@@ -3230,7 +3374,7 @@ test "named Schema types can be made optional and used in arrays" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const schema = try toSchema(T, a, .{});
+    const schema = (try toSchema(T, a, .{})).schema.?;
     const cc = schema.object.get("properties").?.object.get("cc").?.object;
     try std.testing.expectEqualStrings("^[^@]+@[^@]+$", cc.get("pattern").?.string);
     try std.testing.expectEqual(@as(usize, 2), cc.get("type").?.array.items.len);
@@ -3261,7 +3405,7 @@ test "uniqueItems works for any item type and agrees with the schema" {
 
     var v = Validator.init(std.testing.allocator, .{});
     defer v.deinit();
-    const schema = try v.compile(try toSchema(T, a, .{}));
+    const schema = try v.compile((try toSchema(T, a, .{})).schema.?);
     const cases = [_][]const u8{
         \\{"points": [{"x": 1}, {"x": 2}], "others": [], "nested": ["a", "b"]}
         ,
@@ -3309,6 +3453,131 @@ test "field names are converted by field_naming" {
     }
 }
 
+const collision_test_types = struct {
+    /// `user_id` and `userId` are the same key in every convention but `as_is`.
+    const Account = struct { user_id: u32, userId: u32 };
+    /// Only `Account`'s clash reaches the root through these.
+    const Wrapper = struct { items: []const ?*const Account, other: u8 };
+    const Variants = union(enum) { signed_in: u8, signedIn: u8 };
+    const Tagged = union(enum) {
+        pub const json_discriminator = "Kind";
+        a: struct { kind: u8 },
+        b,
+    };
+    const Untagged = union(enum) {
+        pub const json_untagged = true;
+        signed_in: u8,
+        signedIn: []const u8,
+    };
+    const Base = struct { created_at: i64 };
+    const Flat = struct {
+        createdAt: i64,
+        base: Schema(Base, .{ .flatten = true }),
+    };
+    const Fine = struct { user_id: u32, display_name: []const u8, tags: []const struct { tag_name: []const u8 } };
+    /// Refers to itself: the cycle ends the search.
+    const Tree = struct { node_id: u32, children: []const Tree };
+    /// Three names with one key, a variant clash, and `Account` twice.
+    const Many = struct {
+        some_id: u32,
+        someId: u32,
+        Some_id: u32,
+        shape: Variants,
+        first: Account,
+        second: ?Account,
+    };
+};
+
+test "field_naming: names that map to the same key are refused, all of them reported" {
+    const T = collision_test_types;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The same names are fine as they are, and clash once converted.
+    inline for (.{ T.Account, T.Wrapper, T.Variants, T.Flat }) |Decl| {
+        try std.testing.expectEqual(@as(usize, 0), fieldNameCollisions(Decl, .as_is).len);
+        _ = (try toSchema(Decl, a, .{})).schema.?;
+        for ([_]FieldNaming{ .camel_case, .pascal_case, .snake_case, .kebab_case }) |naming| {
+            try std.testing.expectEqual(@as(usize, 1), fieldNameCollisions(Decl, naming).len);
+            // No schema, and the collision as the error.
+            const schema = try toSchema(Decl, a, .{ .field_naming = naming });
+            try std.testing.expect(schema.schema == null);
+            try std.testing.expectEqual(@as(usize, 1), schema.errors.items.len);
+            // No value, and the same collision as a message.
+            const result = try fromJson(Decl, a, "{}", .{ .field_naming = naming });
+            try std.testing.expect(result.value == null);
+            try std.testing.expectEqual(@as(usize, 1), result.errors.items.len);
+        }
+    }
+
+    // Which names, and what they become.
+    const fields = fieldNameCollisions(T.Wrapper, .camel_case)[0];
+    try std.testing.expectEqual(@as(@TypeOf(fields.what), .fields), fields.what);
+    try std.testing.expectEqualStrings("user_id", fields.first);
+    try std.testing.expectEqualStrings("userId", fields.second);
+    try std.testing.expectEqualStrings("userId", fields.key);
+    try std.testing.expect(std.mem.endsWith(u8, fields.type_name, "Account"));
+    const variants = fieldNameCollisions(T.Variants, .snake_case)[0];
+    try std.testing.expectEqual(@as(@TypeOf(variants.what), .variants), variants.what);
+    try std.testing.expectEqualStrings("signed_in", variants.first);
+    try std.testing.expectEqualStrings("signedIn", variants.second);
+    // Through a flattened struct.
+    const flat = fieldNameCollisions(T.Flat, .camel_case)[0];
+    try std.testing.expectEqualStrings("createdAt", flat.first);
+    try std.testing.expectEqualStrings("created_at", flat.second);
+    // The discriminator is never renamed: `kind` becomes "Kind" under pascal_case.
+    try std.testing.expectEqual(@as(usize, 0), fieldNameCollisions(T.Tagged, .camel_case).len);
+    const tag = fieldNameCollisions(T.Tagged, .pascal_case)[0];
+    try std.testing.expectEqual(@as(@TypeOf(tag.what), .discriminator), tag.what);
+    try std.testing.expectEqualStrings("kind", tag.first);
+    try std.testing.expectEqualStrings("Kind", tag.key);
+
+    // The message names the type, the fields and the naming.
+    const message = (try fromJson(T.Account, a, "{}", .{ .field_naming = .camel_case })).errors.items[0];
+    try std.testing.expectEqualStrings("", message.path);
+    try std.testing.expect(std.mem.indexOf(u8, message.message, "fields 'user_id' and 'userId' both become \"userId\" under field_naming .camel_case") != null);
+
+    // Several collisions, in several types: every one is reported, once.
+    const many = fieldNameCollisions(T.Many, .camel_case);
+    try std.testing.expectEqual(@as(usize, 4), many.len);
+    // A name is paired with the first earlier one: three of a kind are two collisions.
+    try std.testing.expectEqualStrings("some_id", many[0].first);
+    try std.testing.expectEqualStrings("someId", many[0].second);
+    try std.testing.expectEqualStrings("some_id", many[1].first);
+    try std.testing.expectEqualStrings("Some_id", many[1].second);
+    // The two uses of `Account` count once.
+    var accounts: usize = 0;
+    for (many) |c| {
+        if (std.mem.endsWith(u8, c.type_name, "Account")) accounts += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), accounts);
+    const result = try toSchema(T.Many, a, .{ .field_naming = .camel_case });
+    try std.testing.expect(result.schema == null);
+    try std.testing.expectEqual(many.len, result.errors.items.len);
+    const decoded = try fromJson(T.Many, a, "{}", .{ .field_naming = .camel_case });
+    try std.testing.expectEqual(many.len, decoded.errors.items.len);
+    for (many, decoded.errors.items) |c, e| {
+        try std.testing.expect(std.mem.indexOf(u8, e.message, c.first) != null);
+        try std.testing.expect(std.mem.indexOf(u8, e.message, c.second) != null);
+    }
+
+    // Untagged variants have no names on the wire; other types are not affected.
+    inline for (.{ T.Untagged, T.Fine, T.Tree }) |Decl| {
+        for ([_]FieldNaming{ .as_is, .camel_case, .pascal_case, .snake_case, .kebab_case }) |naming| {
+            try std.testing.expectEqual(@as(usize, 0), fieldNameCollisions(Decl, naming).len);
+            const schema = try toSchema(Decl, a, .{ .field_naming = naming });
+            try std.testing.expect(schema.schema != null);
+            try std.testing.expectEqual(@as(usize, 0), schema.errors.items.len);
+        }
+    }
+    // A Decoder refuses it too, and keeps working afterwards.
+    var decoder: Decoder = .init(std.testing.allocator);
+    defer decoder.deinit();
+    try std.testing.expect((try decoder.fromJson(T.Account, a, "{}", .{ .field_naming = .camel_case })).value == null);
+    try std.testing.expect((try decoder.fromJson(T.Fine, a, "{\"userId\": 1, \"displayName\": \"x\", \"tags\": []}", .{ .field_naming = .camel_case })).value != null);
+}
+
 test "field_naming applies to the schema, fromJson keys, unknown keys and error paths alike" {
     const Address = struct { zip_code: Schema([]const u8, .{ .minLength = 1 }) };
     const User = struct {
@@ -3321,7 +3590,7 @@ test "field_naming applies to the schema, fromJson keys, unknown keys and error 
     const a = arena.allocator();
     const options: SchemaOptions = .{ .field_naming = .camel_case, .unknown_fields = .deny };
 
-    const schema = try toSchema(User, a, options);
+    const schema = (try toSchema(User, a, options)).schema.?;
     const props = schema.object.get("properties").?.object;
     try std.testing.expectEqualStrings("userId", props.keys()[0]);
     try std.testing.expectEqualStrings("displayName", props.keys()[1]);
@@ -3443,7 +3712,7 @@ test "tagged unions: toSchema and fromJson agree in both representations on ever
                     const options: SchemaOptions = .{ .draft = @enumFromInt(f.value), .unknown_fields = unknown, .reuse_definitions = reuse, .union_encoding = encoding };
                     var v = Validator.init(std.testing.allocator, .{});
                     defer v.deinit();
-                    const generated = try toSchema(T.Drawing, a, options);
+                    const generated = (try toSchema(T.Drawing, a, options)).schema.?;
                     try std.testing.expect(try v.isValidSchema(generated));
                     const schema = try v.compile(generated);
                     for (cases) |text| {
@@ -3543,7 +3812,7 @@ test "untagged unions: toSchema (anyOf) and fromJson agree on every draft" {
                 const options: SchemaOptions = .{ .draft = @enumFromInt(f.value), .unknown_fields = unknown, .reuse_definitions = reuse };
                 var v = Validator.init(std.testing.allocator, .{});
                 defer v.deinit();
-                const generated = try toSchema(T.Request, a, options);
+                const generated = (try toSchema(T.Request, a, options)).schema.?;
                 try std.testing.expect(try v.isValidSchema(generated));
                 const schema = try v.compile(generated);
                 for (cases) |text| {
@@ -3559,7 +3828,7 @@ test "untagged unions: toSchema (anyOf) and fromJson agree on every draft" {
         }
     }
 
-    const generated = try toSchema(T.Request, a, .{});
+    const generated = (try toSchema(T.Request, a, .{})).schema.?;
     const id_def = generated.object.get("$defs").?.object.get("Id").?.object;
     try std.testing.expectEqual(@as(usize, 2), id_def.get("anyOf").?.array.items.len);
     try std.testing.expect(id_def.get("oneOf") == null);
@@ -3671,7 +3940,7 @@ test "extra: merged into toSchema, enforced by fromJson as the runtime validator
                 const options: SchemaOptions = .{ .draft = @enumFromInt(f.value), .unknown_fields = unknown, .reuse_definitions = reuse };
                 var v = Validator.init(std.testing.allocator, .{});
                 defer v.deinit();
-                const generated = try toSchema(T.Order, a, options);
+                const generated = (try toSchema(T.Order, a, options)).schema.?;
                 try std.testing.expect(try v.isValidSchema(generated));
                 const schema = try v.compile(generated);
                 for (cases) |text| {
@@ -3690,7 +3959,7 @@ test "extra: merged into toSchema, enforced by fromJson as the runtime validator
 
     // The extra keywords sit next to the generated ones; the named struct
     // with `.extra` is inlined rather than referenced.
-    const generated = try toSchema(T.Order, a, .{});
+    const generated = (try toSchema(T.Order, a, .{})).schema.?;
     const props = generated.object.get("properties").?.object;
     const payment = props.get("payment").?.object;
     try std.testing.expectEqualStrings("object", payment.get("type").?.string);
@@ -3819,7 +4088,7 @@ test "custom jsonSchema: toSchema and fromJson agree on every draft" {
                 const options: SchemaOptions = .{ .draft = @enumFromInt(f.value), .unknown_fields = unknown, .reuse_definitions = reuse };
                 var v = Validator.init(std.testing.allocator, .{});
                 defer v.deinit();
-                const generated = try toSchema(T.Theme, a, options);
+                const generated = (try toSchema(T.Theme, a, options)).schema.?;
                 try std.testing.expect(try v.isValidSchema(generated));
                 const schema = try v.compile(generated);
                 for (cases) |text| {
@@ -3838,7 +4107,7 @@ test "custom jsonSchema: toSchema and fromJson agree on every draft" {
 
     // Named custom types are shared through $defs; optional ones are
     // wrapped in anyOf rather than widened.
-    const generated = try toSchema(T.Theme, a, .{});
+    const generated = (try toSchema(T.Theme, a, .{})).schema.?;
     const defs = generated.object.get("$defs").?.object;
     try std.testing.expectEqualStrings("^#[0-9a-f]{6}$", defs.get("Color").?.object.get("pattern").?.string);
     try std.testing.expectEqualStrings("#/$defs/Color", defs.get("Gradient").?.object.get("items").?.object.get("$ref").?.string);
@@ -3899,7 +4168,7 @@ test "union_encoding if_then: validators report only the named variant's errors"
         fn ofType(comptime U: type, encoding: UnionEncoding, text: []const u8, alloc: Allocator) ![]const validator.Error {
             var v = Validator.init(std.testing.allocator, .{});
             defer v.deinit();
-            const schema = try v.compile(try toSchema(U, alloc, .{ .union_encoding = encoding }));
+            const schema = try v.compile((try toSchema(U, alloc, .{ .union_encoding = encoding })).schema.?);
             return (try schema.validate(alloc, try std.json.parseFromSliceLeaky(std.json.Value, alloc, text, .{}))).errors;
         }
     };
@@ -3931,9 +4200,9 @@ test "union_encoding if_then: validators report only the named variant's errors"
 
     // Drafts without if/then keep oneOf.
     for ([_]Draft{ .draft4, .draft6 }) |d| {
-        const schema = try toSchema(T.TaggedShape, a, .{ .draft = d, .union_encoding = .if_then });
+        const schema = (try toSchema(T.TaggedShape, a, .{ .draft = d, .union_encoding = .if_then })).schema.?;
         try std.testing.expect(schema.object.get("oneOf") != null);
-        try std.testing.expect((try toSchema(T.Shape, a, .{ .draft = d, .union_encoding = .if_then })).object.get("oneOf") != null);
+        try std.testing.expect(((try toSchema(T.Shape, a, .{ .draft = d, .union_encoding = .if_then })).schema.?).object.get("oneOf") != null);
     }
 }
 
@@ -3996,7 +4265,7 @@ test "flatten: toSchema and fromJson agree, fields read from the enclosing objec
                     const options: SchemaOptions = .{ .draft = @enumFromInt(f.value), .unknown_fields = unknown, .reuse_definitions = reuse, .union_encoding = encoding };
                     var v = Validator.init(std.testing.allocator, .{});
                     defer v.deinit();
-                    const generated = try toSchema(T.Feed, a, options);
+                    const generated = (try toSchema(T.Feed, a, options)).schema.?;
                     try std.testing.expect(try v.isValidSchema(generated));
                     const schema = try v.compile(generated);
                     for (cases) |text| {
@@ -4015,7 +4284,7 @@ test "flatten: toSchema and fromJson agree, fields read from the enclosing objec
     }
 
     // The flattened fields are listed as the post's own.
-    const generated = try toSchema(T.Feed, a, .{});
+    const generated = (try toSchema(T.Feed, a, .{})).schema.?;
     const post = generated.object.get("$defs").?.object.get("Post").?.object;
     const keys = post.get("properties").?.object.keys();
     const expected = [_][]const u8{ "title", "created_at", "updated_at", "author_name", "stamp" };
@@ -4119,7 +4388,7 @@ test "recursive unions are shared through definitions" {
     const a = arena.allocator();
 
     const Program = struct { body: T.Expr };
-    const shared = try toSchema(Program, a, .{});
+    const shared = (try toSchema(Program, a, .{})).schema.?;
     const body = shared.object.get("properties").?.object.get("body").?.object;
     try std.testing.expectEqualStrings("#/$defs/Expr", body.get("$ref").?.string);
 
@@ -4135,7 +4404,7 @@ test "recursive unions are shared through definitions" {
     for ([_]bool{ true, false }) |reuse| {
         var v = Validator.init(std.testing.allocator, .{});
         defer v.deinit();
-        const compiled = try v.compile(try toSchema(Program, a, .{ .reuse_definitions = reuse }));
+        const compiled = try v.compile((try toSchema(Program, a, .{ .reuse_definitions = reuse })).schema.?);
         for (cases) |text| {
             const instance = try std.json.parseFromSliceLeaky(std.json.Value, a, text, .{});
             try std.testing.expectEqual((try fromJson(Program, a, text, .{})).value != null, try compiled.isValid(instance));
@@ -4153,7 +4422,7 @@ test "toSchema makes optional types nullable" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const schema = try toSchema(Product, arena.allocator(), .{});
+    const schema = (try toSchema(Product, arena.allocator(), .{})).schema.?;
     const props = schema.object.get("properties").?.object;
 
     const discount = props.get("discount").?.object;
@@ -4200,7 +4469,7 @@ test "unknown_fields = .deny rejects unknown keys at every level unless a Schema
     try std.testing.expect((try fromJson(Product, a, bad, .{})).value != null);
 
     // Inlined, so the nested objects can be inspected directly.
-    const schema = try toSchema(Product, a, .{ .unknown_fields = .deny, .reuse_definitions = false });
+    const schema = (try toSchema(Product, a, .{ .unknown_fields = .deny, .reuse_definitions = false })).schema.?;
     try std.testing.expectEqual(false, schema.object.get("additionalProperties").?.bool);
     const props = schema.object.get("properties").?.object;
     try std.testing.expectEqual(false, props.get("billing").?.object.get("additionalProperties").?.bool);
@@ -4253,12 +4522,12 @@ test "an explicit additionalProperties on the root struct overrides unknown_fiel
 
     // toSchema emits the same decisions.
     // Inlined, so the nested objects can be inspected directly.
-    const open_schema = try toSchema(Open, a, .{ .unknown_fields = .deny, .reuse_definitions = false });
+    const open_schema = (try toSchema(Open, a, .{ .unknown_fields = .deny, .reuse_definitions = false })).schema.?;
     try std.testing.expectEqual(true, open_schema.object.get("additionalProperties").?.bool);
     const open_address = open_schema.object.get("properties").?.object.get("address").?.object;
     try std.testing.expectEqual(false, open_address.get("additionalProperties").?.bool);
 
-    const closed_schema = try toSchema(Closed, a, .{ .unknown_fields = .allow, .reuse_definitions = false });
+    const closed_schema = (try toSchema(Closed, a, .{ .unknown_fields = .allow, .reuse_definitions = false })).schema.?;
     try std.testing.expectEqual(false, closed_schema.object.get("additionalProperties").?.bool);
     const closed_address = closed_schema.object.get("properties").?.object.get("address").?.object;
     try std.testing.expect(closed_address.get("additionalProperties") == null);
@@ -4330,7 +4599,7 @@ test "non-exhaustive enums are integer newtypes" {
     try std.testing.expectEqualStrings("watchers", constraint.errors.items[0].path); // uniqueItems
     try std.testing.expectEqualStrings("seller", constraint.errors.items[1].path); // minimum
 
-    const schema = try toSchema(Order, a, .{});
+    const schema = (try toSchema(Order, a, .{})).schema.?;
     const props = schema.object.get("properties").?.object;
     try std.testing.expectEqualStrings("integer", props.get("buyer").?.object.get("type").?.string);
     try std.testing.expectEqual(@as(f64, 1), props.get("seller").?.object.get("minimum").?.float);
@@ -4377,7 +4646,7 @@ test "reuse_definitions emits each named struct once and refers to it" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const schema = try toSchema(T.Customer, a, .{});
+    const schema = (try toSchema(T.Customer, a, .{})).schema.?;
     const defs = schema.object.get("$defs").?.object;
     try std.testing.expectEqual(@as(usize, 3), defs.count());
     try std.testing.expect(defs.get("Address") != null);
@@ -4401,13 +4670,13 @@ test "reuse_definitions emits each named struct once and refers to it" {
     try std.testing.expectEqualStrings("#/$defs/Address_2", props.get("legacy").?.object.get("$ref").?.string);
 
     // Drafts before 2019-09 use `definitions`.
-    const d7 = try toSchema(T.Customer, a, .{ .draft = .draft7 });
+    const d7 = (try toSchema(T.Customer, a, .{ .draft = .draft7 })).schema.?;
     try std.testing.expect(d7.object.get("$defs") == null);
     try std.testing.expect(d7.object.get("definitions").?.object.get("Address") != null);
     try std.testing.expectEqualStrings("#/definitions/Address", d7.object.get("properties").?.object.get("home").?.object.get("$ref").?.string);
 
     // With reuse off, every non-recursive struct is inlined.
-    const inlined = try toSchema(T.Customer, a, .{ .reuse_definitions = false });
+    const inlined = (try toSchema(T.Customer, a, .{ .reuse_definitions = false })).schema.?;
     try std.testing.expect(inlined.object.get("$defs") == null);
     try std.testing.expectEqualStrings("object", inlined.object.get("properties").?.object.get("home").?.object.get("type").?.string);
 }
@@ -4433,7 +4702,7 @@ test "recursive types reference themselves in every mode" {
     const a = arena.allocator();
 
     for ([_]bool{ true, false }) |reuse| {
-        const tree = try toSchema(T.TreeNode, a, .{ .reuse_definitions = reuse });
+        const tree = (try toSchema(T.TreeNode, a, .{ .reuse_definitions = reuse })).schema.?;
         const children = tree.object.get("properties").?.object.get("children").?.object;
         try std.testing.expectEqualStrings("#", children.get("items").?.object.get("$ref").?.string);
         try std.testing.expect(tree.object.get("$defs") == null);
@@ -4441,7 +4710,7 @@ test "recursive types reference themselves in every mode" {
 
     // Mutual recursion through the root: `Item` can be inlined, since its
     // way back to `Category` is the root ("#").
-    const cat = try toSchema(T.Category, a, .{ .reuse_definitions = false });
+    const cat = (try toSchema(T.Category, a, .{ .reuse_definitions = false })).schema.?;
     try std.testing.expect(cat.object.get("$defs") == null);
     const item = cat.object.get("properties").?.object.get("items").?.object.get("items").?.object;
     const related = item.get("properties").?.object.get("related").?.object;
@@ -4450,7 +4719,7 @@ test "recursive types reference themselves in every mode" {
     // Recursion below the root: even with reuse off, the recursive type
     // becomes a definition so the schema stays finite.
     const Wrapper = struct { root: T.Category };
-    const wrapped = try toSchema(Wrapper, a, .{ .reuse_definitions = false });
+    const wrapped = (try toSchema(Wrapper, a, .{ .reuse_definitions = false })).schema.?;
     const defs = wrapped.object.get("$defs").?.object;
     const cat_items = defs.get("Category").?.object.get("properties").?.object.get("items").?.object;
     try std.testing.expectEqualStrings("#/$defs/Item", cat_items.get("items").?.object.get("$ref").?.string);
@@ -4497,7 +4766,7 @@ test "shared definitions and recursive schemas agree with fromJson on every draf
             var v = Validator.init(std.testing.allocator, .{});
             defer v.deinit();
 
-            const customer = try toSchema(T.Customer, a, options);
+            const customer = (try toSchema(T.Customer, a, options)).schema.?;
             try std.testing.expect(try v.isValidSchema(customer));
             const customer_schema = try v.compile(customer);
             for (customer_cases) |text| {
@@ -4506,7 +4775,7 @@ test "shared definitions and recursive schemas agree with fromJson on every draf
                 try std.testing.expectEqual(expected, try customer_schema.isValid(instance));
             }
 
-            const tree = try toSchema(T.TreeNode, a, options);
+            const tree = (try toSchema(T.TreeNode, a, options)).schema.?;
             try std.testing.expect(try v.isValidSchema(tree));
             const tree_schema = try v.compile(tree);
             for (tree_cases) |text| {

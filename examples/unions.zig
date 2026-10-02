@@ -55,12 +55,12 @@ pub fn main() !void {
     defer arena.deinit();
     const a = arena.allocator();
 
-    try printJson(a, "Shape (externally tagged)", try js.toSchema(Shape, a, .{}));
-    try printJson(a, "Event (internally tagged by \"type\")", try js.toSchema(Event, a, .{}));
+    try printJson(a, "Shape (externally tagged)", (try js.toSchema(Shape, a, .{})).schema.?);
+    try printJson(a, "Event (internally tagged by \"type\")", (try js.toSchema(Event, a, .{})).schema.?);
     // The same union as if/then: other validators then report only the
     // errors of the variant "type" names, instead of every variant's.
-    try printJson(a, "Event with union_encoding = .if_then", try js.toSchema(Event, a, .{ .union_encoding = .if_then }));
-    try printJson(a, "Shape with union_encoding = .if_then", try js.toSchema(Shape, a, .{ .union_encoding = .if_then }));
+    try printJson(a, "Event with union_encoding = .if_then", (try js.toSchema(Event, a, .{ .union_encoding = .if_then })).schema.?);
+    try printJson(a, "Shape with union_encoding = .if_then", (try js.toSchema(Shape, a, .{ .union_encoding = .if_then })).schema.?);
 
     // --- Decoding gives a plain Zig union to switch on.
     const shapes = [_][]const u8{
@@ -125,7 +125,7 @@ pub fn main() !void {
     }
 
     // --- Untagged: the payload alone, the first matching variant wins.
-    try printJson(a, "Id (untagged, anyOf)", try js.toSchema(Id, a, .{}));
+    try printJson(a, "Id (untagged, anyOf)", (try js.toSchema(Id, a, .{})).schema.?);
     std.debug.print("\n== Decoded ids ==\n", .{});
     for ([_][]const u8{ "42", "\"ada\"" }) |text| {
         switch ((try js.fromJson(Id, a, text, .{})).value.?) {
@@ -141,7 +141,7 @@ pub fn main() !void {
     }
 
     // --- Recursion through the union.
-    try printJson(a, "Expr (recursive, via $defs)", try js.toSchema(struct { body: Expr }, a, .{}));
+    try printJson(a, "Expr (recursive, via $defs)", (try js.toSchema(struct { body: Expr }, a, .{})).schema.?);
     const program = (try js.fromJson(Expr, a,
         \\{"add": [{"num": 1}, {"neg": {"num": 2}}, {"add": [{"num": 3}, {"num": 4}]}]}
     , .{})).value.?;

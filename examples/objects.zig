@@ -45,10 +45,10 @@ pub fn main() !void {
     const a = arena.allocator();
 
     // --- Schema: Address is shared via $defs.
-    try printJson(a, "Customer schema (named structs shared via $defs)", try js.toSchema(Customer, a, .{}));
+    try printJson(a, "Customer schema (named structs shared via $defs)", (try js.toSchema(Customer, a, .{})).schema.?);
 
     // --- The same type with every struct inlined.
-    try printJson(a, "Customer schema with reuse_definitions = false", try js.toSchema(Customer, a, .{ .reuse_definitions = false }));
+    try printJson(a, "Customer schema with reuse_definitions = false", (try js.toSchema(Customer, a, .{ .reuse_definitions = false })).schema.?);
 
     // --- Decoding: nested values are plain Zig structs.
     const text =
@@ -104,7 +104,7 @@ pub fn main() !void {
     try additionalPropertiesDemo(a);
 
     // --- Recursive types.
-    try printJson(a, "Recursive Category schema", try js.toSchema(Category, a, .{}));
+    try printJson(a, "Recursive Category schema", (try js.toSchema(Category, a, .{})).schema.?);
     const tree = (try js.fromJson(Category, a,
         \\{"name": "root", "children": [{"name": "a", "children": []}, {"name": "b", "children": [{"name": "b1", "children": []}]}]}
     , .{})).value.?;
@@ -112,7 +112,7 @@ pub fn main() !void {
     printTree(tree, 0);
 
     // --- Flattening: a struct's fields written into the enclosing object.
-    try printJson(a, "Article (Timestamps flattened)", try js.toSchema(Article, a, .{}));
+    try printJson(a, "Article (Timestamps flattened)", (try js.toSchema(Article, a, .{})).schema.?);
     const article = (try js.fromJson(Article, a,
         \\{"title": "Hello", "created_at": 1700000000, "updated_at": null}
     , .{ .unknown_fields = .deny })).value.?;
@@ -148,7 +148,7 @@ const Settings = Schema(struct {
 
 fn additionalPropertiesDemo(a: std.mem.Allocator) !void {
     const deny: js.SchemaOptions = .{ .unknown_fields = .deny, .reuse_definitions = false };
-    try printJson(a, "Settings schema with unknown_fields = .deny", try js.toSchema(Settings, a, deny));
+    try printJson(a, "Settings schema with unknown_fields = .deny", (try js.toSchema(Settings, a, deny)).schema.?);
 
     const cases = [_]struct { label: []const u8, text: []const u8 }{
         .{ .label = "no extra keys", .text =

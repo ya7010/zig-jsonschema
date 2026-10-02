@@ -36,7 +36,7 @@ pub fn main() !void {
     defer arena.deinit();
     const a = arena.allocator();
 
-    std.debug.print("== Payment ==\n{s}\n", .{try std.json.Stringify.valueAlloc(a, try js.toSchema(Payment, a, .{}), .{ .whitespace = .indent_2 })});
+    std.debug.print("== Payment ==\n{s}\n", .{try std.json.Stringify.valueAlloc(a, (try js.toSchema(Payment, a, .{})).schema.?, .{ .whitespace = .indent_2 })});
 
     const inputs = [_][]const u8{
         \\{"method": "card", "card_number": "4111"}

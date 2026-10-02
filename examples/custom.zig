@@ -66,7 +66,7 @@ pub fn main() !void {
     defer arena.deinit();
     const a = arena.allocator();
 
-    std.debug.print("== Theme ==\n{s}\n", .{try std.json.Stringify.valueAlloc(a, try js.toSchema(Theme, a, .{}), .{ .whitespace = .indent_2 })});
+    std.debug.print("== Theme ==\n{s}\n", .{try std.json.Stringify.valueAlloc(a, (try js.toSchema(Theme, a, .{})).schema.?, .{ .whitespace = .indent_2 })});
 
     const theme = (try js.fromJson(Theme, a,
         \\{"name": "dusk", "primary": "#ff8800", "accent": null, "background": ["#000000", "#3355ff"]}
