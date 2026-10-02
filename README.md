@@ -76,7 +76,9 @@ Keywords the constraint fields don't cover (`if` / `then` / `else`, `allOf`,
 `not`, `enum`, ...) go in `.extra`, as JSON text merged into the generated
 schema. It is checked at comptime (it must be a JSON object that doesn't
 contain a keyword the generator emits for that kind of value), and
-`fromJson` enforces it with the runtime validator:
+`fromJson` enforces it with the runtime validator (use a `js.Decoder` to
+decode many documents, which compiles that schema once instead of on every
+call):
 
 ```zig
 const Payment = js.Schema(struct {

@@ -566,8 +566,9 @@ fn requireOpenEnum(comptime T: type) void {
 /// - `fromJson` enforces it with the runtime `Validator` (against the
 ///   generated schema of this value, so keywords such as
 ///   `unevaluatedProperties` see the generated ones), reporting its errors
-///   at the offending location. `validate`, which has no JSON to check,
-///   rejects types that use `.extra` at comptime.
+///   at the offending location (a `Decoder` keeps what that compiles
+///   across calls). `validate`, which has no JSON to check, rejects types
+///   that use `.extra` at comptime.
 /// - Don't use `$ref` in it: `fromJson` checks it against the schema of
 ///   this value alone, where a reference would not resolve as it does in
 ///   the full document.
@@ -1952,22 +1953,76 @@ pub fn FromJsonResult(comptime T: type) type {
 /// defaults; `options.unknown_fields` is honoured and the generation-only
 /// fields of `SchemaOptions` are ignored, so passing the options given to
 /// `toSchema` makes both accept the same documents.
+///
+/// This builds the runtime validator behind `.extra` and `jsonSchema` types
+/// anew on every call; to decode many documents, use a `Decoder`.
 pub fn fromJson(
     comptime Decl: type,
     allocator: Allocator,
     json_text: []const u8,
     options: SchemaOptions,
 ) Allocator.Error!FromJsonResult(Unwrap(Decl)) {
+    var decoder: Decoder = .init(allocator);
+    defer decoder.deinit();
+    return decoder.fromJson(Decl, allocator, json_text, options);
+}
+
+/// `fromJson` for many documents. `.extra` and `jsonSchema` types are
+/// enforced by compiling their schemas with the runtime `Validator`; a
+/// `Decoder` does that once per type and set of options, and keeps the
+/// result for every later call, which `fromJson` alone cannot.
+///
+/// ```zig
+/// var decoder = js.Decoder.init(gpa);
+/// defer decoder.deinit();
+/// for (documents) |text| {
+///     const result = try decoder.fromJson(Order, arena, text, .{});
+///     ...
+/// }
+/// ```
+///
+/// - `gpa` holds the compiled schemas until `deinit`, so give it an
+///   allocator that outlives the calls. Each call's results use the
+///   `allocator` passed to it, as with `fromJson`.
+/// - A `Decoder` is not thread-safe: use one per thread.
+pub const Decoder = struct {
+    extras: Extras,
+
+    pub fn init(gpa: Allocator) Decoder {
+        return .{ .extras = .init(gpa) };
+    }
+
+    pub fn deinit(self: *Decoder) void {
+        self.extras.deinit();
+    }
+
+    /// Like the free `fromJson`, reusing what earlier calls compiled.
+    pub fn fromJson(
+        self: *Decoder,
+        comptime Decl: type,
+        allocator: Allocator,
+        json_text: []const u8,
+        options: SchemaOptions,
+    ) Allocator.Error!FromJsonResult(Unwrap(Decl)) {
+        return decodeJson(Decl, allocator, json_text, options, &self.extras);
+    }
+};
+
+fn decodeJson(
+    comptime Decl: type,
+    allocator: Allocator,
+    json_text: []const u8,
+    options: SchemaOptions,
+    extras: *Extras,
+) Allocator.Error!FromJsonResult(Unwrap(Decl)) {
     var errors: std.ArrayList(ValidationError) = .empty;
-    var extras: Extras = .init(allocator);
-    defer extras.deinit();
 
     const json_value = std.json.parseFromSliceLeaky(std.json.Value, allocator, json_text, .{}) catch |err| {
         try addError(&errors, allocator, "", "invalid JSON: {s}", .{@errorName(err)});
         return .{ .value = null, .errors = errors };
     };
 
-    const decoded: ?Unwrap(Decl) = decodeValue(Decl, json_value, "", null, options, &extras, allocator, &errors) catch |err| switch (err) {
+    const decoded: ?Unwrap(Decl) = decodeValue(Decl, json_value, "", null, options, extras, allocator, &errors) catch |err| switch (err) {
         error.Invalid => null,
         else => |e| return e,
     };
@@ -1988,8 +2043,44 @@ const Extras = struct {
     /// Holds the generated schemas, which the compiled ones refer to.
     arena: std.heap.ArenaAllocator,
     validator: Validator,
-    /// `@typeName` -> compiled schema, or null if it is not a valid schema.
-    compiled: std.StringHashMapUnmanaged(?CompiledSchema) = .empty,
+    /// Compiled schema of a type under some options, or null if it is not
+    /// a valid schema.
+    compiled: std.HashMapUnmanaged(SchemaKey, ?CompiledSchema, SchemaKeyContext, std.hash_map.default_max_load_percentage) = .empty,
+    /// How many schemas were compiled (tests check the reuse).
+    compilations: usize = 0,
+
+    /// What decides the schema generated for a type.
+    const SchemaKey = struct {
+        type_id: *const anyopaque,
+        draft: Draft,
+        field_naming: FieldNaming,
+        unknown_fields: UnknownFields,
+        reuse_definitions: bool,
+        union_encoding: UnionEncoding,
+    };
+
+    const SchemaKeyContext = struct {
+        pub fn hash(_: SchemaKeyContext, key: SchemaKey) u64 {
+            var h = std.hash.Wyhash.init(0);
+            std.hash.autoHash(&h, key);
+            return h.final();
+        }
+
+        pub fn eql(_: SchemaKeyContext, a: SchemaKey, b: SchemaKey) bool {
+            return std.meta.eql(a, b);
+        }
+    };
+
+    /// A pointer that differs for every type `T` (unlike `@typeName`, which
+    /// two different types may share).
+    fn typeId(comptime T: type) *const anyopaque {
+        return &struct {
+            var unique: u8 = 0;
+            comptime {
+                _ = T;
+            }
+        }.unique;
+    }
 
     fn init(gpa: Allocator) Extras {
         return .{ .gpa = gpa, .arena = .init(gpa), .validator = .init(gpa, .{}) };
@@ -2004,7 +2095,16 @@ const Extras = struct {
     /// The compiled schema of `Labelled` (a `Schema()` label, or an
     /// optional one), generated with `options` as the root.
     fn schemaOf(extras: *Extras, comptime Labelled: type, options: SchemaOptions) Allocator.Error!?CompiledSchema {
-        if (extras.compiled.get(@typeName(Labelled))) |s| return s;
+        // The other options (`id`, `emit_schema_uri`) are overridden below.
+        const key: SchemaKey = .{
+            .type_id = typeId(Labelled),
+            .draft = options.draft,
+            .field_naming = options.field_naming,
+            .unknown_fields = options.unknown_fields,
+            .reuse_definitions = options.reuse_definitions,
+            .union_encoding = options.union_encoding,
+        };
+        if (extras.compiled.get(key)) |s| return s;
         var opts = options;
         opts.id = null;
         opts.emit_schema_uri = true;
@@ -2017,7 +2117,8 @@ const Extras = struct {
             error.OutOfMemory => return error.OutOfMemory,
             else => null,
         };
-        try extras.compiled.put(extras.gpa, @typeName(Labelled), compiled);
+        extras.compilations += 1;
+        try extras.compiled.put(extras.gpa, key, compiled);
         return compiled;
     }
 };
@@ -3947,6 +4048,68 @@ test "flatten: toSchema and fromJson agree, fields read from the enclosing objec
     }, a, &errors);
     try std.testing.expectEqual(@as(usize, 1), errors.items.len);
     try std.testing.expectEqualStrings("created_at", errors.items[0].path);
+}
+
+test "Decoder compiles each schema once per type and options, across calls" {
+    const E = extra_test_types;
+    const C = custom_test_types;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const order =
+        \\{"payment": {"method": "card", "card_number": "4111"}, "country": "jp", "fallback": "us", "ship_to": {"city": "X"}, "tags": ["gift"], "id": 1}
+    ;
+    const bad_order =
+        \\{"payment": {"method": "card"}, "country": "zz", "fallback": null, "ship_to": {"city": "X"}, "tags": [], "id": 0}
+    ;
+    const theme =
+        \\{"name": "t", "primary": "#ff8800", "accent": null, "level": "low", "fallback_level": null, "palette": [], "background": ["#000000", "#ffffff"], "mark": "high"}
+    ;
+
+    var decoder: Decoder = .init(std.testing.allocator);
+    defer decoder.deinit();
+
+    // A schema is compiled when a call first reaches its type (`fallback: null`
+    // reaches the optional `?Code`, which `order` does not).
+    try std.testing.expect((try decoder.fromJson(E.Order, a, order, .{})).value != null);
+    const after_first = decoder.extras.compilations;
+    try std.testing.expect(after_first > 0);
+    try std.testing.expect((try decoder.fromJson(E.Order, a, bad_order, .{})).value == null);
+    try std.testing.expect(decoder.extras.compilations > after_first);
+    const warm = decoder.extras.compilations;
+
+    // Later calls compile nothing, whatever they decode, and agree with `fromJson`.
+    for (0..3) |_| {
+        try std.testing.expect((try decoder.fromJson(E.Order, a, order, .{})).value != null);
+        const bad = try decoder.fromJson(E.Order, a, bad_order, .{});
+        const once = try fromJson(E.Order, a, bad_order, .{});
+        try std.testing.expectEqual(once.errors.items.len, bad.errors.items.len);
+        for (once.errors.items, bad.errors.items) |x, y| {
+            try std.testing.expectEqualStrings(x.path, y.path);
+            try std.testing.expectEqualStrings(x.message, y.message);
+        }
+    }
+    try std.testing.expectEqual(warm, decoder.extras.compilations);
+
+    // Another type adds its own schemas; the first one's stay usable.
+    try std.testing.expect((try decoder.fromJson(C.Theme, a, theme, .{})).value != null);
+    const with_theme = decoder.extras.compilations;
+    try std.testing.expect(with_theme > warm);
+    try std.testing.expect((try decoder.fromJson(E.Order, a, order, .{})).value != null);
+    try std.testing.expect((try decoder.fromJson(C.Theme, a, theme, .{})).value != null);
+    try std.testing.expectEqual(with_theme, decoder.extras.compilations);
+
+    // The schema depends on the options: other options, another entry.
+    const camel: SchemaOptions = .{ .field_naming = .camel_case };
+    try std.testing.expect((try decoder.fromJson(E.Order, a, order, camel)).value == null); // keys are camelCase now
+    try std.testing.expect(decoder.extras.compilations > with_theme);
+    const with_camel = decoder.extras.compilations;
+    _ = try decoder.fromJson(E.Order, a, order, camel);
+    try std.testing.expectEqual(with_camel, decoder.extras.compilations);
+    // ... while `id` and `emit_schema_uri` do not matter.
+    _ = try decoder.fromJson(E.Order, a, order, .{ .id = "https://example.com/order", .emit_schema_uri = false });
+    try std.testing.expectEqual(with_camel, decoder.extras.compilations);
 }
 
 test "recursive unions are shared through definitions" {

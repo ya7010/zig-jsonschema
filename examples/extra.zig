@@ -7,6 +7,8 @@
 //! - `toSchema` merges it next to the generated keywords.
 //! - `fromJson` enforces it with the runtime `Validator`, so the generated
 //!   schema and `fromJson` still accept the same documents.
+//! - Compiling that schema is the expensive part: a `Decoder` does it once
+//!   and reuses it for every document, where `fromJson` alone repeats it.
 const std = @import("std");
 const js = @import("jsonschema");
 const Schema = js.Schema;
@@ -48,9 +50,12 @@ pub fn main() !void {
         \\{"method": "cash"}
         ,
     };
-    std.debug.print("\n== fromJson ==\n", .{});
+    // One decoder for all the documents (use one per thread).
+    var decoder = js.Decoder.init(std.heap.page_allocator);
+    defer decoder.deinit();
+    std.debug.print("\n== Decoder.fromJson ==\n", .{});
     for (inputs) |text| {
-        const result = try js.fromJson(Payment, a, text, .{});
+        const result = try decoder.fromJson(Payment, a, text, .{});
         if (result.value) |p| {
             std.debug.print("{s}\n  -> ok: {s}\n", .{ text, p.method });
             continue;
