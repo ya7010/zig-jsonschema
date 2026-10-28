@@ -45,7 +45,7 @@ pub fn build(b: *std.Build) void {
     // Snapshot tests of the generated schemas (tests/schema_gen/<case>/<draft>.schema.json).
     const update_snapshots = b.option(bool, "update-snapshots", "Rewrite the schema generation snapshots instead of comparing") orelse false;
     const schema_gen_options = b.addOptions();
-    schema_gen_options.addOption([]const u8, "snapshot_dir", b.pathFromRoot("tests/schema_gen"));
+    schema_gen_options.addOptionPathDirectory("snapshot_dir", b.path("tests/schema_gen"));
     schema_gen_options.addOption(bool, "update", update_snapshots);
     const schema_gen_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -71,7 +71,7 @@ pub fn build(b: *std.Build) void {
     const suite_verbose = b.option(bool, "suite-verbose", "Print every failing optional test-suite case") orelse false;
     if (b.lazyDependency("JSON-Schema-Test-Suite", .{})) |suite_dep| {
         const suite_options = b.addOptions();
-        suite_options.addOptionPath("suite_dir", suite_dep.path(""));
+        suite_options.addOptionPathDirectory("suite_dir", suite_dep.path(""));
         suite_options.addOption(bool, "verbose", suite_verbose);
 
         const suite_runner = b.addExecutable(.{

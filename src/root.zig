@@ -31,6 +31,10 @@
 //! ```
 
 const std = @import("std");
+const type_fields = @import("type_fields.zig");
+const structFields = type_fields.structFields;
+const unionFields = type_fields.unionFields;
+const enumFields = type_fields.enumFields;
 const Allocator = std.mem.Allocator;
 
 // --- Runtime validation of arbitrary JSON Schema documents -------------------
@@ -242,7 +246,7 @@ fn isUntagged(comptime T: type) bool {
     if (@hasDecl(T, "json_discriminator")) {
         @compileError("jsonschema: union " ++ @typeName(T) ++ " cannot declare both json_untagged and json_discriminator");
     }
-    for (@typeInfo(T).@"union".fields) |f| {
+    for (unionFields(T)) |f| {
         if (stripSchema(f.type) == void) @compileError("jsonschema: variant '" ++ f.name ++ "' of untagged union " ++
             @typeName(T) ++ " has no payload; use an optional (`?T`) for a null alternative");
     }
@@ -253,7 +257,7 @@ fn isUntagged(comptime T: type) bool {
 fn discriminatorOf(comptime T: type) ?[]const u8 {
     if (!@hasDecl(T, "json_discriminator")) return null;
     const key: []const u8 = T.json_discriminator;
-    for (@typeInfo(T).@"union".fields) |f| {
+    for (unionFields(T)) |f| {
         const Payload = stripSchema(f.type);
         switch (@typeInfo(Payload)) {
             .void => {},
@@ -512,7 +516,7 @@ fn rejectFlattened(comptime F: type) void {
 fn propertyNames(comptime T: type) []const []const u8 {
     comptime {
         var names: []const []const u8 = &.{};
-        for (@typeInfo(T).@"struct".fields) |f| {
+        for (structFields(T)) |f| {
             const more: []const []const u8 = if (isFlattened(f.type)) propertyNames(f.type.zjs_inner) else &.{f.name};
             for (more) |n| {
                 for (names) |m| if (std.mem.eql(u8, m, n)) {
@@ -535,7 +539,7 @@ fn stripSchema(comptime T: type) type {
 /// newtype: it is a distinct type, but is (de)serialized and constrained as
 /// its tag integer. Exhaustive enums have no such obvious JSON form.
 fn requireOpenEnum(comptime T: type) void {
-    if (@typeInfo(T).@"enum".is_exhaustive) {
+    if (@typeInfo(T).@"enum".mode == .exhaustive) {
         @compileError("jsonschema: exhaustive enum " ++ @typeName(T) ++
             " is not supported; use a non-exhaustive enum such as `enum(u64) { _ }` for an integer newtype");
     }
@@ -650,9 +654,9 @@ pub fn Unwrap(comptime Decl: type) type {
 /// The same union with every payload type unwrapped (and the same tag enum).
 fn unwrapUnion(comptime Decl: type) type {
     const info = @typeInfo(Decl).@"union";
-    var names: [info.fields.len][]const u8 = undefined;
-    var types: [info.fields.len]type = undefined;
-    for (info.fields, 0..) |f, i| {
+    var names: [unionFields(Decl).len][]const u8 = undefined;
+    var types: [unionFields(Decl).len]type = undefined;
+    for (unionFields(Decl), 0..) |f, i| {
         names[i] = f.name;
         types[i] = Unwrap(f.type);
     }
@@ -666,16 +670,16 @@ fn containedTypes(comptime T: type) []const type {
     return switch (@typeInfo(T)) {
         .optional => |o| &.{o.child},
         .pointer => |p| if ((p.size == .slice and p.child != u8) or p.size == .one) &.{p.child} else &.{},
-        .@"struct" => |s| blk: {
+        .@"struct" => blk: {
             if (isSchema(T)) break :blk &.{T.zjs_inner};
-            var types: [s.fields.len]type = undefined;
-            for (s.fields, 0..) |f, i| types[i] = f.type;
+            var types: [structFields(T).len]type = undefined;
+            for (structFields(T), 0..) |f, i| types[i] = f.type;
             const final = types;
             break :blk &final;
         },
-        .@"union" => |u| blk: {
-            var types: [u.fields.len]type = undefined;
-            for (u.fields, 0..) |f, i| types[i] = f.type;
+        .@"union" => blk: {
+            var types: [unionFields(T).len]type = undefined;
+            for (unionFields(T), 0..) |f, i| types[i] = f.type;
             const final = types;
             break :blk &final;
         },
@@ -715,12 +719,11 @@ fn reaches(comptime T: type, comptime target: type, comptime visiting: []const t
 
 fn unwrapStruct(comptime Decl: type) type {
     @setEvalBranchQuota(100_000);
-    const info = @typeInfo(Decl).@"struct";
-    var field_names: [info.fields.len][]const u8 = undefined;
-    var field_types: [info.fields.len]type = undefined;
-    var field_attrs: [info.fields.len]std.builtin.Type.StructField.Attributes = undefined;
+    var field_names: [structFields(Decl).len][]const u8 = undefined;
+    var field_types: [structFields(Decl).len]type = undefined;
+    var field_attrs: [structFields(Decl).len]type_fields.StructFieldAttributes = undefined;
 
-    for (info.fields, 0..) |f, i| {
+    for (structFields(Decl), 0..) |f, i| {
         field_names[i] = f.name;
         field_types[i] = Unwrap(f.type);
         field_attrs[i] = fieldAttrs(f);
@@ -729,7 +732,7 @@ fn unwrapStruct(comptime Decl: type) type {
     return @Struct(.auto, null, &field_names, &field_types, &field_attrs);
 }
 
-fn fieldAttrs(comptime f: std.builtin.Type.StructField) std.builtin.Type.StructField.Attributes {
+fn fieldAttrs(comptime f: type_fields.StructField) type_fields.StructFieldAttributes {
     if (fieldDefaultValue(f)) |dv| {
         const FieldT = Unwrap(f.type);
         const default_val: FieldT = dv;
@@ -742,7 +745,7 @@ fn fieldAttrs(comptime f: std.builtin.Type.StructField) std.builtin.Type.StructF
 /// absent from the JSON input. `fieldAttrs` deals with comptime-only
 /// pointers for type construction (`@Struct`), whereas `decodeValue` just
 /// needs a single value at runtime, hence this separate helper.
-fn fieldDefaultValue(comptime f: std.builtin.Type.StructField) ?Unwrap(f.type) {
+fn fieldDefaultValue(comptime f: type_fields.StructField) ?Unwrap(f.type) {
     if (comptime isSchema(f.type)) return constraintsDefaultValue(f.type);
     // A plain field whose type contains `Schema()` labels (e.g. a nested
     // schema struct) is a different type once unwrapped, so its Zig default
@@ -776,14 +779,14 @@ fn numberFromF64(comptime T: type, v: f64) T {
         .optional => |info| @as(T, numberFromF64(info.child, v)),
         .int => @intFromFloat(v),
         .float => @floatCast(v),
-        .@"enum" => |e| @enumFromInt(@as(e.tag_type, @intFromFloat(v))),
+        .@"enum" => |e| @fromBackingInt(@intCast(@as(e.tag_type, @intFromFloat(v)))),
         else => @compileError("jsonschema: default is only supported for numeric types, got " ++ @typeName(T)),
     };
 }
 
 /// Whether a field may be omitted from the JSON input (it has a default
 /// value, or its type is optional).
-fn isOptionalField(comptime f: std.builtin.Type.StructField) bool {
+fn isOptionalField(comptime f: type_fields.StructField) bool {
     if (fieldDefaultValue(f) != null) return true;
     if (comptime isSchema(f.type)) return @typeInfo(f.type.zjs_inner) == .optional;
     return @typeInfo(f.type) == .optional;
@@ -920,12 +923,12 @@ fn scanCollisions(comptime T: type, comptime naming: FieldNaming, comptime scan:
         .@"struct" => out.found = out.found ++ clashes(T, naming, .fields, propertyNames(T)),
         .@"union" => {
             if (!isUntagged(T)) {
-                var names: [@typeInfo(T).@"union".fields.len][]const u8 = undefined;
-                for (@typeInfo(T).@"union".fields, 0..) |f, i| names[i] = f.name;
+                var names: [unionFields(T).len][]const u8 = undefined;
+                for (unionFields(T), 0..) |f, i| names[i] = f.name;
                 out.found = out.found ++ clashes(T, naming, .variants, &names);
             }
             if (discriminatorOf(T)) |key| {
-                for (@typeInfo(T).@"union".fields) |f| {
+                for (unionFields(T)) |f| {
                     const Payload = stripSchema(f.type);
                     if (@typeInfo(Payload) != .@"struct") continue;
                     for (propertyNames(Payload)) |name| {
@@ -1341,7 +1344,7 @@ fn buildSchemaFor(comptime T: type, constraints: ConstraintsFor(T), gen: *Gen) A
 /// The properties of struct `StructT`, the fields of flattened ones included.
 fn addProperties(comptime StructT: type, props: *std.json.ObjectMap, required: *std.json.Array, gen: *Gen) Allocator.Error!void {
     _ = comptime propertyNames(StructT); // no duplicates
-    inline for (@typeInfo(StructT).@"struct".fields) |f| {
+    inline for (structFields(StructT)) |f| {
         if (comptime isFlattened(f.type)) {
             try addProperties(f.type.zjs_inner, props, required, gen);
         } else {
@@ -1461,7 +1464,7 @@ fn buildUnionSchema(comptime T: type, constraints: UnionConstraints, gen: *Gen) 
     const discriminator = comptime discriminatorOf(T);
     const untagged = comptime isUntagged(T);
     var branches: std.json.Array = .init(allocator);
-    inline for (@typeInfo(T).@"union".fields) |f| {
+    inline for (unionFields(T)) |f| {
         const name = jsonName(f.name, gen.options.field_naming);
         const Payload = stripSchema(f.type);
         if (untagged) {
@@ -1525,7 +1528,7 @@ fn buildUnionSchema(comptime T: type, constraints: UnionConstraints, gen: *Gen) 
 fn putIfThenBranches(comptime T: type, key: []const u8, obj: *std.json.ObjectMap, branches: std.json.Array, gen: *Gen) Allocator.Error!void {
     const allocator = gen.allocator;
     var names: std.json.Array = .init(allocator);
-    inline for (@typeInfo(T).@"union".fields) |f| try names.append(.{ .string = jsonName(f.name, gen.options.field_naming) });
+    inline for (unionFields(T)) |f| try names.append(.{ .string = jsonName(f.name, gen.options.field_naming) });
     var key_schema: std.json.ObjectMap = .empty;
     try key_schema.put(allocator, "enum", .{ .array = names });
     var props: std.json.ObjectMap = .empty;
@@ -1561,7 +1564,7 @@ fn putIfThenBranches(comptime T: type, key: []const u8, obj: *std.json.ObjectMap
 fn putExternalIfThenBranches(comptime T: type, obj: *std.json.ObjectMap, branches: std.json.Array, gen: *Gen) Allocator.Error!void {
     const allocator = gen.allocator;
     var names: std.json.Array = .init(allocator);
-    inline for (@typeInfo(T).@"union".fields) |f| try names.append(.{ .string = jsonName(f.name, gen.options.field_naming) });
+    inline for (unionFields(T)) |f| try names.append(.{ .string = jsonName(f.name, gen.options.field_naming) });
     var name_schema: std.json.ObjectMap = .empty;
     try name_schema.put(allocator, "enum", .{ .array = names });
 
@@ -1862,8 +1865,8 @@ fn validatePath(
                 try validatePath(info.child, elem, idx_path, check, allocator, errors);
             }
         },
-        .@"struct" => |info| {
-            inline for (info.fields) |f| {
+        .@"struct" => {
+            inline for (structFields(Decl)) |f| {
                 // A flattened struct's fields sit in this object.
                 const child_path = if (comptime isFlattened(f.type)) path else try childPath(path, jsonName(f.name, check.naming), allocator);
                 try validatePath(f.type, @field(value, f.name), child_path, check, allocator, errors);
@@ -1902,7 +1905,7 @@ fn checkConstraints(
 
     switch (@typeInfo(Inner)) {
         .int, .float => try checkNumberConstraints(Inner, value, constraints, path, allocator, errors),
-        .@"enum" => |e| try checkNumberConstraints(e.tag_type, @intFromEnum(value), constraints, path, allocator, errors),
+        .@"enum" => |e| try checkNumberConstraints(e.tag_type, @backingInt(value), constraints, path, allocator, errors),
         .bool => {}, // no assertion keywords for booleans in this MVP
         .pointer => |p| {
             if (p.size == .one) {
@@ -2042,8 +2045,8 @@ fn valuesEqual(comptime T: type, a: T, b: T) bool {
             },
             else => @compileError("jsonschema: unsupported pointer type " ++ @typeName(T)),
         },
-        .@"struct" => |info| blk: {
-            inline for (info.fields) |f| if (!valuesEqual(f.type, @field(a, f.name), @field(b, f.name))) break :blk false;
+        .@"struct" => blk: {
+            inline for (structFields(T)) |f| if (!valuesEqual(f.type, @field(a, f.name), @field(b, f.name))) break :blk false;
             break :blk true;
         },
         .@"union" => switch (a) {
@@ -2425,7 +2428,7 @@ fn decodeValue(
                 },
             }
         },
-        .@"enum" => |e| return @enumFromInt(try decodeInt(e.tag_type, Decl, value, path, options, allocator, errors)),
+        .@"enum" => |e| return @fromBackingInt(@intCast(try decodeInt(e.tag_type, Decl, value, path, options, allocator, errors))),
         .int => return decodeInt(Decl, Decl, value, path, options, allocator, errors),
         .float => {
             const f: f64 = switch (value) {
@@ -2487,7 +2490,7 @@ fn decodeValue(
             }
             @compileError("jsonschema: unsupported pointer type " ++ @typeName(Decl));
         },
-        .@"struct" => |info| {
+        .@"struct" => {
             if (value != .object) {
                 try addError(errors, allocator, path, "expected an object, got {s}", .{@tagName(value)});
                 return error.Invalid;
@@ -2499,7 +2502,7 @@ fn decodeValue(
                 any_failed = try reportAdditionalProperties(Decl, value.object, path, options.field_naming, allocator, errors);
             }
 
-            inline for (info.fields) |f| {
+            inline for (structFields(Decl)) |f| {
                 const name = jsonName(f.name, options.field_naming);
                 const child_path = try childPath(path, name, allocator);
                 if (comptime isFlattened(f.type)) {
@@ -2551,7 +2554,7 @@ fn decodeUnion(
     allocator: Allocator,
     errors: *std.ArrayList(ValidationError),
 ) DecodeError!Unwrap(Decl) {
-    const fields = @typeInfo(Decl).@"union".fields;
+    const fields = unionFields(Decl);
     if (comptime isUntagged(Decl)) return decodeUntagged(Decl, value, path, options, extras, allocator, errors);
     if (value != .object) {
         try addError(errors, allocator, path, "expected an object, got {s}", .{@tagName(value)});
@@ -2615,7 +2618,7 @@ fn decodeUntagged(
     allocator: Allocator,
     errors: *std.ArrayList(ValidationError),
 ) DecodeError!Unwrap(Decl) {
-    const fields = @typeInfo(Decl).@"union".fields;
+    const fields = unionFields(Decl);
     var attempts: [fields.len]std.ArrayList(ValidationError) = @splat(.empty);
     inline for (fields, 0..) |f, i| {
         const attempt = &attempts[i];
@@ -2698,7 +2701,7 @@ fn numberText(value: std.json.Value, allocator: Allocator) Allocator.Error![]con
 
 /// Whether `key` is a JSON property of struct `StructT` (flattened fields included).
 fn isProperty(comptime StructT: type, key: []const u8, naming: FieldNaming) bool {
-    inline for (@typeInfo(StructT).@"struct".fields) |f| {
+    inline for (structFields(StructT)) |f| {
         if (comptime isFlattened(f.type)) {
             if (isProperty(f.type.zjs_inner, key, naming)) return true;
         } else if (std.mem.eql(u8, jsonName(f.name, naming), key)) return true;
@@ -3127,8 +3130,8 @@ test "toSchema emits the root id with the draft's keyword" {
     const a = arena.allocator();
 
     const id = "https://example.com/schemas/customer.json";
-    inline for (std.meta.fields(Draft)) |f| {
-        const draft: Draft = @enumFromInt(f.value);
+    inline for (enumFields(Draft)) |f| {
+        const draft: Draft = @fromBackingInt(@intCast(f.value));
         const schema = (try toSchema(T.Customer, a, .{ .draft = draft, .id = id })).schema.?;
         const keyword, const other = if (draft == .draft4) .{ "id", "$id" } else .{ "$id", "id" };
         try std.testing.expectEqualStrings(id, schema.object.get(keyword).?.string);
@@ -3202,9 +3205,9 @@ test "toSchema output is valid for every draft and matches fromJson" {
         ,
     };
 
-    inline for (std.meta.fields(Draft)) |f| {
+    inline for (enumFields(Draft)) |f| {
         for ([_]UnknownFields{ .allow, .deny }) |mode| {
-            const options: SchemaOptions = .{ .draft = @enumFromInt(f.value), .unknown_fields = mode };
+            const options: SchemaOptions = .{ .draft = @fromBackingInt(@intCast(f.value)), .unknown_fields = mode };
             const generated = (try toSchema(Product, allocator, options)).schema.?;
 
             // The runtime validator picks the dialect up from `$schema`, not from its default.
@@ -3294,8 +3297,8 @@ test "integer and narrow float ranges agree between toSchema and fromJson" {
         ,
     };
 
-    inline for (std.meta.fields(Draft)) |f| {
-        const options: SchemaOptions = .{ .draft = @enumFromInt(f.value) };
+    inline for (enumFields(Draft)) |f| {
+        const options: SchemaOptions = .{ .draft = @fromBackingInt(@intCast(f.value)) };
         var v = Validator.init(std.testing.allocator, .{});
         defer v.deinit();
         const generated = (try toSchema(T, a, options)).schema.?;
@@ -3705,11 +3708,11 @@ test "tagged unions: toSchema and fromJson agree in both representations on ever
         ,
     };
 
-    inline for (std.meta.fields(Draft)) |f| {
+    inline for (enumFields(Draft)) |f| {
         for ([_]UnknownFields{ .allow, .deny }) |unknown| {
             for ([_]UnionEncoding{ .one_of, .if_then }) |encoding| {
                 for ([_]bool{ true, false }) |reuse| {
-                    const options: SchemaOptions = .{ .draft = @enumFromInt(f.value), .unknown_fields = unknown, .reuse_definitions = reuse, .union_encoding = encoding };
+                    const options: SchemaOptions = .{ .draft = @fromBackingInt(@intCast(f.value)), .unknown_fields = unknown, .reuse_definitions = reuse, .union_encoding = encoding };
                     var v = Validator.init(std.testing.allocator, .{});
                     defer v.deinit();
                     const generated = (try toSchema(T.Drawing, a, options)).schema.?;
@@ -3806,10 +3809,10 @@ test "untagged unions: toSchema (anyOf) and fromJson agree on every draft" {
         ,
     };
 
-    inline for (std.meta.fields(Draft)) |f| {
+    inline for (enumFields(Draft)) |f| {
         for ([_]UnknownFields{ .allow, .deny }) |unknown| {
             for ([_]bool{ true, false }) |reuse| {
-                const options: SchemaOptions = .{ .draft = @enumFromInt(f.value), .unknown_fields = unknown, .reuse_definitions = reuse };
+                const options: SchemaOptions = .{ .draft = @fromBackingInt(@intCast(f.value)), .unknown_fields = unknown, .reuse_definitions = reuse };
                 var v = Validator.init(std.testing.allocator, .{});
                 defer v.deinit();
                 const generated = (try toSchema(T.Request, a, options)).schema.?;
@@ -3934,10 +3937,10 @@ test "extra: merged into toSchema, enforced by fromJson as the runtime validator
         ,
     };
 
-    inline for (std.meta.fields(Draft)) |f| {
+    inline for (enumFields(Draft)) |f| {
         for ([_]UnknownFields{ .allow, .deny }) |unknown| {
             for ([_]bool{ true, false }) |reuse| {
-                const options: SchemaOptions = .{ .draft = @enumFromInt(f.value), .unknown_fields = unknown, .reuse_definitions = reuse };
+                const options: SchemaOptions = .{ .draft = @fromBackingInt(@intCast(f.value)), .unknown_fields = unknown, .reuse_definitions = reuse };
                 var v = Validator.init(std.testing.allocator, .{});
                 defer v.deinit();
                 const generated = (try toSchema(T.Order, a, options)).schema.?;
@@ -4082,10 +4085,10 @@ test "custom jsonSchema: toSchema and fromJson agree on every draft" {
         ,
     };
 
-    inline for (std.meta.fields(Draft)) |f| {
+    inline for (enumFields(Draft)) |f| {
         for ([_]UnknownFields{ .allow, .deny }) |unknown| {
             for ([_]bool{ true, false }) |reuse| {
-                const options: SchemaOptions = .{ .draft = @enumFromInt(f.value), .unknown_fields = unknown, .reuse_definitions = reuse };
+                const options: SchemaOptions = .{ .draft = @fromBackingInt(@intCast(f.value)), .unknown_fields = unknown, .reuse_definitions = reuse };
                 var v = Validator.init(std.testing.allocator, .{});
                 defer v.deinit();
                 const generated = (try toSchema(T.Theme, a, options)).schema.?;
@@ -4258,11 +4261,11 @@ test "flatten: toSchema and fromJson agree, fields read from the enclosing objec
         "{\"post\": {\"title\": \"t\", \"created_at\": 1, \"author_name\": \"ada\", " ++ stamp ++ "}, \"event\": {\"kind\": \"deleted\"}}",
     };
 
-    inline for (std.meta.fields(Draft)) |f| {
+    inline for (enumFields(Draft)) |f| {
         for ([_]UnknownFields{ .allow, .deny }) |unknown| {
             for ([_]bool{ true, false }) |reuse| {
                 for ([_]UnionEncoding{ .one_of, .if_then }) |encoding| {
-                    const options: SchemaOptions = .{ .draft = @enumFromInt(f.value), .unknown_fields = unknown, .reuse_definitions = reuse, .union_encoding = encoding };
+                    const options: SchemaOptions = .{ .draft = @fromBackingInt(@intCast(f.value)), .unknown_fields = unknown, .reuse_definitions = reuse, .union_encoding = encoding };
                     var v = Validator.init(std.testing.allocator, .{});
                     defer v.deinit();
                     const generated = (try toSchema(T.Feed, a, options)).schema.?;
@@ -4577,9 +4580,9 @@ test "non-exhaustive enums are integer newtypes" {
     , .{});
     try std.testing.expectEqual(@as(usize, 0), ok.errors.items.len);
     const order = ok.value.?;
-    try std.testing.expectEqual(@as(UserId, @enumFromInt(7)), order.buyer);
+    try std.testing.expectEqual(@as(UserId, @fromBackingInt(@intCast(7))), order.buyer);
     try std.testing.expectEqual(Level.high, order.level); // Schema default
-    try std.testing.expectEqual(@as(u32, 2), @intFromEnum(order.watchers[1]));
+    try std.testing.expectEqual(@as(u32, 2), @backingInt(order.watchers[1]));
 
     const bad = try fromJson(Order, a,
         \\{"buyer": -1, "seller": 0, "watchers": [1, 1], "referrer": "x"}
@@ -4760,9 +4763,9 @@ test "shared definitions and recursive schemas agree with fromJson on every draf
         ,
     };
 
-    inline for (std.meta.fields(Draft)) |f| {
+    inline for (enumFields(Draft)) |f| {
         for ([_]bool{ true, false }) |reuse| {
-            const options: SchemaOptions = .{ .draft = @enumFromInt(f.value), .reuse_definitions = reuse };
+            const options: SchemaOptions = .{ .draft = @fromBackingInt(@intCast(f.value)), .reuse_definitions = reuse };
             var v = Validator.init(std.testing.allocator, .{});
             defer v.deinit();
 

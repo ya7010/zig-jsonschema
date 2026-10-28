@@ -1,6 +1,6 @@
 # zig-jsonschema
 
-JSON Schema for Zig 0.16, in two parts:
+JSON Schema for Zig 0.17, in two parts:
 
 - **Comptime schema generation and typed decoding.** Declare constraints on
   a Zig struct with `Schema(T, constraints)`, generate a JSON Schema

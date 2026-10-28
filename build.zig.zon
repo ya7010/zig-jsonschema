@@ -8,7 +8,7 @@
             .lazy = true,
         },
     },
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .paths = .{""},
     .fingerprint = 0x376f668179a21bb4,
 }
