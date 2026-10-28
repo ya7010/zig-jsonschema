@@ -46,7 +46,7 @@ pub fn main() !void {
     ;
     const order = (try js.fromJson(Order, a, text, .{})).value.?;
     std.debug.print("\n== Decoded ==\n", .{});
-    std.debug.print("id={d} owner={d} contact={s} cc={s}\n", .{ @intFromEnum(order.id), @intFromEnum(order.owner), order.contact, order.cc orelse "-" });
+    std.debug.print("id={d} owner={d} contact={s} cc={s}\n", .{ @backingInt(order.id), @backingInt(order.owner), order.contact, order.cc orelse "-" });
     std.debug.print("discount={d}% quantity={d} priority={d} (default) note=\"{s}\" gift={}\n", .{ order.discount, order.quantity, order.priority, order.note, order.gift });
     // `order.owner = order.id;` would not compile: the newtypes are distinct.
 

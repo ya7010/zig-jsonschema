@@ -15,6 +15,7 @@
 //! ```
 
 const std = @import("std");
+const enumFields = @import("type_fields.zig").enumFields;
 const Allocator = std.mem.Allocator;
 const Value = std.json.Value;
 const uri = @import("uri.zig");
@@ -41,8 +42,8 @@ pub const Draft = enum {
     /// Maps a `$schema` URI of one of the official metaschemas to its draft.
     pub fn fromMetaschemaUri(s: []const u8) ?Draft {
         const base = uri.splitFragment(s).base;
-        inline for (std.meta.fields(Draft)) |f| {
-            const d: Draft = @enumFromInt(f.value);
+        inline for (enumFields(Draft)) |f| {
+            const d: Draft = @fromBackingInt(@intCast(f.value));
             if (std.mem.eql(u8, base, d.metaschemaUri())) return d;
             // Tolerate the http/https mix-up that is common in the wild.
             const m = d.metaschemaUri();
@@ -54,7 +55,7 @@ pub const Draft = enum {
     }
 
     fn atLeast(d: Draft, other: Draft) bool {
-        return @intFromEnum(d) >= @intFromEnum(other);
+        return @backingInt(d) >= @backingInt(other);
     }
 };
 
